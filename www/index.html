@@ -2,15 +2,43 @@
 
 <head>
   <title>WebSocket Test</title>
+  <style>
+    table {
+      border-collapse: collapse;
+    }
+
+    td {
+      border: 1px solid black;
+      padding: 0.5rem;
+      vertical-align: top;
+    }
+
+    pre {
+      margin: 0;
+    }
+  </style>
 </head>
 
 <body>
   <p>Time to test a server.</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Sent</th>
+        <th>Received</th>
+        <th>Preview</th>
+      </tr>
+    </thead>
+    <tbody id="log">
+    </tbody>
+  </table>
 
   <script>
     (async () => {
       const { promise: wsReady, resolve: resolveWsReady, reject: rejectWsReady } = Promise.withResolvers();
       const ws = new WebSocket("ws://localhost:8667/events");
+      ws.binaryType = "arraybuffer";
+
       ws.addEventListener("open", () => {
         resolveWsReady();
       });
@@ -18,10 +46,67 @@
         console.error("websocket error", err);
         rejectWsReady(err);
       });
+
+      function createLogCell(msg) {
+        const td = document.createElement("td");
+        const pre = document.createElement("pre");
+        for (let i = 0; i < msg.length; i++) {
+          if (i > 0 && i % 16 === 0) {
+            pre.innerHTML += "\n";
+          } else if (i > 0) {
+            pre.innerHTML += " ";
+          }
+          pre.innerHTML += msg[i].toString(16).padStart(2, "0");
+        }
+        td.appendChild(pre);
+        return td;
+      }
+      function createHexView(msg) {
+        const td = document.createElement("td");
+        const pre = document.createElement("pre");
+        for (let r = 0; r <= Math.floor(msg.length / 16); r++) {
+          if (r > 0) {
+            pre.innerHTML += "\n";
+          }
+          pre.innerHTML += "| ";
+          for (let i = 0; i < 16; i++) {
+            const b = msg[16 * r + i];
+            if (b === undefined) {
+              pre.innerHTML += " ";
+            } else if (0x20 <= b && b <= 0x7E) {
+              pre.innerHTML += String.fromCharCode(b);
+            } else {
+              pre.innerHTML += ".";
+            }
+          }
+          pre.innerHTML += " |";
+        }
+        td.appendChild(pre);
+        return td;
+      }
+      function send(msg) {
+        const row = document.createElement("tr");
+        row.appendChild(createLogCell(msg));
+        row.appendChild(document.createElement("td"));
+        row.appendChild(createHexView(msg));
+        window.log.appendChild(row);
+        ws.send(msg);
+      }
+      function receive(msg) {
+        const row = document.createElement("tr");
+        row.appendChild(document.createElement("td"));
+        row.appendChild(createLogCell(msg));
+        row.appendChild(createHexView(msg));
+        window.log.appendChild(row);
+      }
+
+      ws.addEventListener("message", msg => {
+        receive(new Uint8Array(msg.data));
+      });
       
       await wsReady;
-      ws.send(new Uint8Array([0x00, 0x01, 0x02, 0x03]));
-      ws.close();
+      send(new Uint8Array([0x00, 0x01, 0x02, 0x03]));
+      setInterval(() => ws.close(), 1000);
     })();
   </script>
 </body>
