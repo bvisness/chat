@@ -1,0 +1,190 @@
+package chat
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"slices"
+	"time"
+
+	"github.com/bvisness/chat/utils"
+	"github.com/gorilla/websocket"
+)
+
+const maxMessageSize = 16 * utils.KiB
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+	// TODO(ben): The Error property here would allow us to send nicer HTTP errors during the
+	// upgrade process. Might be nice.
+}
+
+// NOTE(ben): The server will set this to true during shutdown.
+var shutDownEventStreams = false
+
+const eventStreamShutdownTimeout = 8 * time.Second
+
+func hEventStream(c *Request) (res Response) {
+	conn, err := upgrader.Upgrade(c.RawRes, c.RawReq, nil)
+	if err != nil {
+		// TODO(ben): What kinds of errors can occur during upgrading? Is this a client issue or server issue?
+		return c.ErrorResponse(500, "o no")
+	}
+	defer conn.Close() // NOTE(ben): This closes the TCP socket entirely.
+
+	// NOTE(ben): We know up front that this is being hijacked, so just set the return value now.
+	res = c.Hijacked()
+
+	var unexpectedErr error
+	defer func() {
+		if unexpectedErr != nil {
+			// TODO(ben): Logging
+		}
+	}()
+
+	type EventStreamState int
+	const (
+		ESActive EventStreamState = iota
+		ESServerClosing
+	)
+	state := ESActive
+	var buf [maxMessageSize]byte
+
+	for {
+		// NOTE(ben): We are going to do a style of closing that is reasonably "clean", at least
+		// according to my interpretation of the WebSocket spec. The general guidance it gives is that
+		// a closure is "clean" if both sides both send and receive a close frame (in some order).
+		// Generally speaking, this means either:
+		//
+		// - Client sends close frame to server, server immediately sends close frame and closes the
+		//   TCP connection.
+		// - Server sends close frame to client, client immediately sends close frame, server drains
+		//   any remaining messages and closes the TCP connection.
+		//
+		// In both cases the server is expected to close the TCP connection. It's worth noting that the
+		// client may never receive the close message because the TCP connection is closed immediately
+		// after - this is basically not a problem since the client will already know it's in a closing
+		// state.
+		//
+		// Also, in both cases, the server can shut down immediately upon receiving a close frame from
+		// the client. This is nice symmetry. Having the server close the connection in the second case
+		// also gives the server an opportunity to reliably receive and process any final messages from
+		// the client. (Within reason; a timeout is probably wise.)
+		//
+		// None of this really matters from an application reliability perspective, because we will
+		// have our own application-level ACKs that reflect things like, say, persisting events to
+		// disk. All this is just to be nice and minimize confusion and noise on client and server.
+
+		if state == ESActive && shutDownEventStreams {
+			state = ESServerClosing
+			conn.SetReadDeadline(time.Now().Add(eventStreamShutdownTimeout))
+
+			err := conn.WriteMessage(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseGoingAway, "server shutting down"),
+			)
+			if err != nil {
+				unexpectedErr = err
+				return
+			}
+
+			// NOTE(ben): Now we continue to to drain the rest of the queue. We expect to see a close
+			// frame eventually, if the client is well-behaved.
+		}
+
+		messageType, messageReader, err := conn.NextReader()
+		if closeError, ok := errors.AsType[*websocket.CloseError](err); ok {
+			typicalCodes := []int{websocket.CloseNormalClosure, websocket.CloseGoingAway}
+			if !slices.Contains(typicalCodes, closeError.Code) {
+				// TODO(ben): Debug log the unusual code
+			}
+			// TODO(ben): Debug log that the client is closing the connection
+			return
+		} else if errors.Is(err, os.ErrDeadlineExceeded) {
+			utils.Assert(state == ESServerClosing, "expected server to be closing, but state was", state)
+			// TODO(ben): Debug log that we timed out
+			return
+		} else if err != nil {
+			unexpectedErr = err
+			return
+		}
+
+		message, err := utils.ReadAllInto(messageReader, buf[:])
+		if err == utils.ErrorTooBigForBuffer {
+			// TODO(ben): Log that message was too big
+			err := conn.WriteMessage(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseMessageTooBig, fmt.Sprintf("messages must be at most %d bytes", maxMessageSize)),
+			)
+			if err != nil {
+				unexpectedErr = err
+			}
+			return
+		} else if err != nil {
+			unexpectedErr = err
+			return
+		}
+
+		// NOTE(ben): Maybe someday we'll have the textual version of these messages, but for now only
+		// binary is supported.
+		if messageType != websocket.BinaryMessage {
+			err := conn.WriteMessage(
+				websocket.BinaryMessage,
+				ErrorMessage("only binary messages are supported"),
+			)
+			if err != nil {
+				unexpectedErr = err
+				return
+			}
+			continue
+		}
+
+		err = handleClientMessage(conn, message)
+		if err != nil {
+			unexpectedErr = err
+			return
+		}
+	}
+}
+
+func handleClientMessage(conn *websocket.Conn, message []byte) error {
+	p := messageParser{message: message}
+
+	messageType, err := p.ReadByte()
+	if err != nil {
+		return err
+	}
+	switch messageType {
+	default:
+		err := conn.WriteMessage(websocket.BinaryMessage, ErrorMessage("unknown message type %v", messageType))
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+type messageParser struct {
+	message []byte
+	cur     int
+}
+
+func (p *messageParser) ReadByte() (byte, error) {
+	res, err := p.ReadBytes(1)
+	if err != nil {
+		return 0, err
+	}
+	return res[0], nil
+}
+
+func (p *messageParser) ReadBytes(n int) ([]byte, error) {
+	if len(p.message[p.cur:]) < n {
+		return nil, io.ErrUnexpectedEOF
+	}
+	res := p.message[p.cur : p.cur+n]
+	p.cur += n
+	return res, nil
+}
