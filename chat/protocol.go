@@ -7,18 +7,20 @@ import "fmt"
 // https://github.com/aolo2/chat/blob/master/src/websocket/websocket.h
 // ============================================================================
 
+type EventType byte
+
+const (
+	ETMessage        EventType = 0
+	ETDeleteMessage  EventType = 1
+	ETEdit           EventType = 2
+	ETReply          EventType = 3 // TODO(ben): Seems like this could be a parameter on the message, probably.
+	ETReactionAdd    EventType = 4
+	ETReactionRemove EventType = 5
+)
+
 type MessageType byte
 
 const (
-	MTMessage        MessageType = 0
-	MTDeleteMessage  MessageType = 1
-	MTEdit           MessageType = 2
-	MTReply          MessageType = 3 // TODO(ben): Seems like this could be a parameter on the message, probably.
-	MTReactionAdd    MessageType = 4
-	MTReactionRemove MessageType = 5
-
-	// TODO(ben): Need to make a distinction between WebSocket protocol messages and application
-	// events to be synced!
 	MTError    MessageType = 0xFE
 	MTReserved MessageType = 0xFF
 )

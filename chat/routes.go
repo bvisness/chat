@@ -3,5 +3,5 @@ package chat
 // Routes are defined here so it's easier to find them by opening a single file.
 
 var Routes = []Route{
-	Route{"GET", "/events", hEventStream},
+	{"GET", "/events", hEventStream},
 }

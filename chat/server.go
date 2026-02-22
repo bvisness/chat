@@ -9,23 +9,28 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/bvisness/chat/glog"
 )
 
 const serverShutdownTimeout = 10 * time.Second
+
+var log = glog.Logger{}
 
 func Run() {
 	var wg sync.WaitGroup
 
 	wg.Add(1)
 	server := http.Server{
-		Addr:    ":8667",
+		Addr:    "localhost:8667",
 		Handler: http.HandlerFunc(mainHandler),
 	}
 	go func() {
-		// TODO(ben): Logging
-		serverErr := server.ListenAndServe()
-		if serverErr != http.ErrServerClosed {
-			// TODO(ben): Logging
+		log.Info("Starting server", glog.F{"addr", server.Addr})
+		err := server.ListenAndServe()
+		if err != http.ErrServerClosed {
+			log.Err("Failed to start server", err)
+			os.Exit(1)
 		}
 		// The wg.Done() happens in the shutdown logic below.
 	}()
@@ -34,7 +39,7 @@ func Run() {
 	signal.Notify(signals, os.Interrupt)
 	go func() {
 		<-signals // First SIGINT (start shutdown)
-		// TODO(ben): Logging
+		log.Info("Shutting down server (gracefully)")
 
 		go func() {
 			timeoutCtx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
@@ -42,24 +47,28 @@ func Run() {
 			shutDownEventStreams = true
 			err := server.Shutdown(timeoutCtx)
 			if err != nil {
-				// TODO(ben): Logging of un-graceful shutdown
+				log.Err("Server did not shut down gracefully", err)
 			}
 			wg.Done()
 		}()
 
 		<-signals // Second SIGINT (force quit)
-		// TODO(ben): Logging
+		log.Warning("Server was forcibly shut down")
 		os.Exit(1)
 	}()
 
 	wg.Wait()
+	log.Info("Bye bye!")
 }
 
 func mainHandler(rawRes http.ResponseWriter, rawReq *http.Request) {
+	log := log
+
 	var h Handler
 	for _, route := range Routes {
 		if route.Method == rawReq.Method && route.Path == rawReq.URL.Path {
 			h = route.Handler
+			log = log.WithFields(glog.F{"route", route})
 			break
 		}
 	}
@@ -76,20 +85,21 @@ func mainHandler(rawRes http.ResponseWriter, rawReq *http.Request) {
 		RawRes: rawRes,
 
 		Ctx: rawReq.Context(),
+		Log: log,
 	}
 	res := h(&req)
 
 	if res.Hijacked {
-		// Control of this request has been handed off to something else,
-		// e.g. a WebSocket handler.
+		// NOTE(ben): Control of this request has been handed off to something else, e.g. a
+		// WebSocket handler.
 		return
 	}
 
 	rawRes.WriteHeader(res.StatusCode)
 	_, err := io.Copy(rawRes, &res.Body) // NOTE(ben): This will not incur an intermediate copy because bytes.Buffer implements WriteTo.
 	if err == syscall.EPIPE {
-		// The other side hung up. Oh well.
+		// NOTE(ben): The other side hung up. Oh well.
 	} else if err != nil {
-		// TODO(ben): Logging
+		log.Err("Failed to write response", err)
 	}
 }

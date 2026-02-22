@@ -3,13 +3,20 @@ package chat
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
+
+	"github.com/bvisness/chat/glog"
 )
 
 type Route struct {
 	Method  string
 	Path    string // Includes leading slash
 	Handler Handler
+}
+
+func (r *Route) String() string {
+	return fmt.Sprintf("%s %s", r.Method, r.Path)
 }
 
 type Handler func(c *Request) Response
@@ -21,6 +28,7 @@ type Request struct {
 	RawRes http.ResponseWriter
 
 	Ctx context.Context
+	Log glog.Logger
 }
 
 type Response struct {

@@ -8,6 +8,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/bvisness/chat/glog"
 	"github.com/bvisness/chat/utils"
 	"github.com/gorilla/websocket"
 )
@@ -27,6 +28,8 @@ var shutDownEventStreams = false
 const eventStreamShutdownTimeout = 8 * time.Second
 
 func hEventStream(c *Request) (res Response) {
+	log := c.Log
+
 	conn, err := upgrader.Upgrade(c.RawRes, c.RawReq, nil)
 	if err != nil {
 		// TODO(ben): What kinds of errors can occur during upgrading? Is this a client issue or server issue?
@@ -40,7 +43,7 @@ func hEventStream(c *Request) (res Response) {
 	var unexpectedErr error
 	defer func() {
 		if unexpectedErr != nil {
-			// TODO(ben): Logging
+			log.Err("Unexpected fatal error in WebSocket server", err)
 		}
 	}()
 
@@ -98,13 +101,26 @@ func hEventStream(c *Request) (res Response) {
 		if closeError, ok := errors.AsType[*websocket.CloseError](err); ok {
 			typicalCodes := []int{websocket.CloseNormalClosure, websocket.CloseGoingAway}
 			if !slices.Contains(typicalCodes, closeError.Code) {
-				// TODO(ben): Debug log the unusual code
+				log.Debug("Got unusual close code, does it mean anything?",
+					glog.F{"code", closeError.Code},
+					glog.F{"reason", closeError.Text},
+				)
 			}
-			// TODO(ben): Debug log that the client is closing the connection
+			log.Debug("Client is closing the WebSocket connection; we will also close and exit")
+			err := conn.WriteMessage(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(
+					closeError.Code, // NOTE(ben): Per section 5.5.1, it is apparently typical to echo the close code you received.
+					"o7",
+				),
+			)
+			if err != nil {
+				unexpectedErr = err
+			}
 			return
 		} else if errors.Is(err, os.ErrDeadlineExceeded) {
 			utils.Assert(state == ESServerClosing, "expected server to be closing, but state was", state)
-			// TODO(ben): Debug log that we timed out
+			log.Debug("Timed out waiting for client messages while shutting down")
 			return
 		} else if err != nil {
 			unexpectedErr = err
@@ -113,7 +129,7 @@ func hEventStream(c *Request) (res Response) {
 
 		message, err := utils.ReadAllInto(messageReader, buf[:])
 		if err == utils.ErrorTooBigForBuffer {
-			// TODO(ben): Log that message was too big
+			log.Warning("Got oversize message, closing connection")
 			err := conn.WriteMessage(
 				websocket.CloseMessage,
 				websocket.FormatCloseMessage(websocket.CloseMessageTooBig, fmt.Sprintf("messages must be at most %d bytes", maxMessageSize)),
