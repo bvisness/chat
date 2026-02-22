@@ -68,7 +68,7 @@ func mainHandler(rawRes http.ResponseWriter, rawReq *http.Request) {
 	for _, route := range Routes {
 		if route.Method == rawReq.Method && route.Path == rawReq.URL.Path {
 			h = route.Handler
-			log = log.WithFields(glog.F{"route", route})
+			log = log.WithFields(glog.F{"route", route.String()})
 			break
 		}
 	}
@@ -87,6 +87,7 @@ func mainHandler(rawRes http.ResponseWriter, rawReq *http.Request) {
 		Ctx: rawReq.Context(),
 		Log: log,
 	}
+	log.Log("REQUEST", "Request received")
 	res := h(&req)
 
 	if res.Hijacked {

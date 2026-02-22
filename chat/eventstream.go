@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"slices"
 	"time"
@@ -20,6 +21,12 @@ var upgrader = websocket.Upgrader{
 	WriteBufferSize: 4096,
 	// TODO(ben): The Error property here would allow us to send nicer HTTP errors during the
 	// upgrade process. Might be nice.
+
+	// TODO(ben): It's not clear to me if we actually care what origin the request comes from. After
+	// all, we might have clients connecting from mobile or other places that wouldn't set an Origin
+	// header. (I assume user agents other than browsers don't typically set an Origin header,
+	// because what would they set it to?)
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
 // NOTE(ben): The server will set this to true during shutdown.
@@ -30,20 +37,20 @@ const eventStreamShutdownTimeout = 8 * time.Second
 func hEventStream(c *Request) (res Response) {
 	log := c.Log
 
-	conn, err := upgrader.Upgrade(c.RawRes, c.RawReq, nil)
-	if err != nil {
-		// TODO(ben): What kinds of errors can occur during upgrading? Is this a client issue or server issue?
-		return c.ErrorResponse(500, "o no")
-	}
-	defer conn.Close() // NOTE(ben): This closes the TCP socket entirely.
-
 	// NOTE(ben): We know up front that this is being hijacked, so just set the return value now.
 	res = c.Hijacked()
+
+	conn, err := upgrader.Upgrade(c.RawRes, c.RawReq, nil)
+	if err != nil {
+		log.Err("Failed to upgrade WebSocket connection", err)
+		return
+	}
+	defer conn.Close() // NOTE(ben): This closes the TCP socket entirely.
 
 	var unexpectedErr error
 	defer func() {
 		if unexpectedErr != nil {
-			log.Err("Unexpected fatal error in WebSocket server", err)
+			log.Err("Unexpected fatal error in WebSocket server", unexpectedErr)
 		}
 	}()
 
@@ -99,24 +106,20 @@ func hEventStream(c *Request) (res Response) {
 
 		messageType, messageReader, err := conn.NextReader()
 		if closeError, ok := errors.AsType[*websocket.CloseError](err); ok {
-			typicalCodes := []int{websocket.CloseNormalClosure, websocket.CloseGoingAway}
+			typicalCodes := []int{websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived}
 			if !slices.Contains(typicalCodes, closeError.Code) {
 				log.Debug("Got unusual close code, does it mean anything?",
 					glog.F{"code", closeError.Code},
 					glog.F{"reason", closeError.Text},
 				)
 			}
-			log.Debug("Client is closing the WebSocket connection; we will also close and exit")
-			err := conn.WriteMessage(
-				websocket.CloseMessage,
-				websocket.FormatCloseMessage(
-					closeError.Code, // NOTE(ben): Per section 5.5.1, it is apparently typical to echo the close code you received.
-					"o7",
-				),
+			log.Debug("Client is closing the WebSocket connection; we will also close and exit",
+				glog.F{"code", closeError.Code},
+				glog.F{"reason", closeError.Text},
 			)
-			if err != nil {
-				unexpectedErr = err
-			}
+			// NOTE(ben): gorilla/websocket has a default close handler that responds by echoing the
+			// received close code, which is apparently conventional. So no need to explicitly send our
+			// own close message here.
 			return
 		} else if errors.Is(err, os.ErrDeadlineExceeded) {
 			utils.Assert(state == ESServerClosing, "expected server to be closing, but state was", state)

@@ -16,14 +16,15 @@ func (l *Logger) Log(channel string, msg string, fields ...F) {
 	b.Grow(100) // NOTE(ben): 100 characters should be enough for any body
 
 	fmt.Fprintf(&b, "%s [%s] %s", time.Now().Format("2006-01-02 15:04:05"), channel, msg)
-	for i, f := range fields {
+	allFields := append(l.Fields, fields...)
+	for i, f := range allFields {
 		if i == 0 {
 			fmt.Fprintf(&b, " [")
 		} else {
 			fmt.Fprintf(&b, ", ")
 		}
 		fmt.Fprintf(&b, "%s=\"%v\"", f.Name, f.Value)
-		if i == len(fields)-1 {
+		if i == len(allFields)-1 {
 			fmt.Fprintf(&b, "]")
 		}
 	}

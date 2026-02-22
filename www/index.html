@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+
+<head>
+  <title>WebSocket Test</title>
+</head>
+
+<body>
+  <p>Time to test a server.</p>
+
+  <script>
+    (async () => {
+      const { promise: wsReady, resolve: resolveWsReady, reject: rejectWsReady } = Promise.withResolvers();
+      const ws = new WebSocket("ws://localhost:8667/events");
+      ws.addEventListener("open", () => {
+        resolveWsReady();
+      });
+      ws.addEventListener("error", err => {
+        console.error("websocket error", err);
+        rejectWsReady(err);
+      });
+      
+      await wsReady;
+      ws.send(new Uint8Array([0x00, 0x01, 0x02, 0x03]));
+      ws.close();
+    })();
+  </script>
+</body>
