@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/bvisness/chat/glog"
@@ -29,13 +30,17 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-// NOTE(ben): The server will set this to true during shutdown.
-var shutDownEventStreams = false
+var eventStreamWaitGroup sync.WaitGroup
+var eventStreamShutdownSignal = make(chan struct{})
 
 const eventStreamShutdownTimeout = 8 * time.Second
 
 func hEventStream(c *Request) (res Response) {
 	log := c.Log
+	defer log.Debug("Event stream handler exited")
+
+	eventStreamWaitGroup.Add(1)
+	defer eventStreamWaitGroup.Done()
 
 	// NOTE(ben): We know up front that this is being hijacked, so just set the return value now.
 	res = c.Hijacked()
@@ -62,6 +67,33 @@ func hEventStream(c *Request) (res Response) {
 	state := ESActive
 	var buf [maxMessageSize]byte
 
+	// Background reader: puts WebSocket messages onto a channel.
+	type readResult struct {
+		messageType   int
+		messageReader io.Reader
+		err           error
+	}
+	reads := make(chan readResult, 1)
+	defer close(reads)
+	go func() {
+		defer log.Debug("Reader goroutine is shutting down")
+		for {
+			messageType, messageReader, err := conn.NextReader()
+			reads <- readResult{messageType, messageReader, err}
+			if err != nil {
+				return
+			}
+
+			// NOTE(ben): We cannot call NextReader again until the main loop is done with the message.
+			// So we just reuse the channel to double as synchronization the other way. When the channel
+			// is closed, we exit.
+			_, goAgain := <-reads
+			if !goAgain {
+				return
+			}
+		}
+	}()
+
 	for {
 		// NOTE(ben): We are going to do a style of closing that is reasonably "clean", at least
 		// according to my interpretation of the WebSocket spec. The general guidance it gives is that
@@ -87,83 +119,88 @@ func hEventStream(c *Request) (res Response) {
 		// have our own application-level ACKs that reflect things like, say, persisting events to
 		// disk. All this is just to be nice and minimize confusion and noise on client and server.
 
-		if state == ESActive && shutDownEventStreams {
-			state = ESServerClosing
-			conn.SetReadDeadline(time.Now().Add(eventStreamShutdownTimeout))
+		select {
+		case <-eventStreamShutdownSignal:
+			if state == ESActive {
+				state = ESServerClosing
+				conn.SetReadDeadline(time.Now().Add(eventStreamShutdownTimeout))
 
-			err := conn.WriteMessage(
-				websocket.CloseMessage,
-				websocket.FormatCloseMessage(websocket.CloseGoingAway, "server shutting down"),
-			)
-			if err != nil {
-				unexpectedErr = err
-				return
+				err := conn.WriteMessage(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseGoingAway, "server shutting down"),
+				)
+				if err != nil {
+					unexpectedErr = fmt.Errorf("in shutdown: %w", err)
+					return
+				}
+
+				// NOTE(ben): Now we continue to to drain the rest of the queue. We expect to see a close
+				// frame eventually, if the client is well-behaved.
 			}
 
-			// NOTE(ben): Now we continue to to drain the rest of the queue. We expect to see a close
-			// frame eventually, if the client is well-behaved.
-		}
-
-		messageType, messageReader, err := conn.NextReader()
-		if closeError, ok := errors.AsType[*websocket.CloseError](err); ok {
-			typicalCodes := []int{websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived}
-			if !slices.Contains(typicalCodes, closeError.Code) {
-				log.Debug("Got unusual close code, does it mean anything?",
+		case read := <-reads:
+			if closeError, ok := errors.AsType[*websocket.CloseError](read.err); ok {
+				typicalCodes := []int{websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived}
+				if !slices.Contains(typicalCodes, closeError.Code) {
+					log.Debug("Got unusual close code, does it mean anything?",
+						glog.F{"code", closeError.Code},
+						glog.F{"reason", closeError.Text},
+					)
+				}
+				log.Debug("Client is closing the WebSocket connection; we will also close and exit",
 					glog.F{"code", closeError.Code},
 					glog.F{"reason", closeError.Text},
 				)
-			}
-			log.Debug("Client is closing the WebSocket connection; we will also close and exit",
-				glog.F{"code", closeError.Code},
-				glog.F{"reason", closeError.Text},
-			)
-			// NOTE(ben): gorilla/websocket has a default close handler that responds by echoing the
-			// received close code, which is apparently conventional. So no need to explicitly send our
-			// own close message here.
-			return
-		} else if errors.Is(err, os.ErrDeadlineExceeded) {
-			utils.Assert(state == ESServerClosing, "expected server to be closing, but state was", state)
-			log.Debug("Timed out waiting for client messages while shutting down")
-			return
-		} else if err != nil {
-			unexpectedErr = err
-			return
-		}
-
-		message, err := utils.ReadAllInto(messageReader, buf[:])
-		if err == utils.ErrorTooBigForBuffer {
-			log.Warning("Got oversize message, closing connection")
-			err := conn.WriteMessage(
-				websocket.CloseMessage,
-				websocket.FormatCloseMessage(websocket.CloseMessageTooBig, fmt.Sprintf("messages must be at most %d bytes", maxMessageSize)),
-			)
-			if err != nil {
-				unexpectedErr = err
-			}
-			return
-		} else if err != nil {
-			unexpectedErr = err
-			return
-		}
-
-		// NOTE(ben): Maybe someday we'll have the textual version of these messages, but for now only
-		// binary is supported.
-		if messageType != websocket.BinaryMessage {
-			err := conn.WriteMessage(
-				websocket.BinaryMessage,
-				ErrorMessage("only binary messages are supported"),
-			)
-			if err != nil {
-				unexpectedErr = err
+				// NOTE(ben): gorilla/websocket has a default close handler that responds by echoing the
+				// received close code, which is apparently conventional. So no need to explicitly send our
+				// own close message here.
+				return
+			} else if errors.Is(read.err, os.ErrDeadlineExceeded) {
+				utils.Assert(state == ESServerClosing, "expected server to be closing, but state was", state)
+				log.Debug("Timed out waiting for client messages while shutting down")
+				return
+			} else if read.err != nil {
+				unexpectedErr = fmt.Errorf("on read: %w", read.err)
 				return
 			}
-			continue
-		}
 
-		err = handleClientMessage(conn, message)
-		if err != nil {
-			unexpectedErr = err
-			return
+			message, err := utils.ReadAllInto(read.messageReader, buf[:])
+			if err == utils.ErrorTooBigForBuffer {
+				log.Warning("Got oversize message, closing connection")
+				err := conn.WriteMessage(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseMessageTooBig, fmt.Sprintf("messages must be at most %d bytes", maxMessageSize)),
+				)
+				if err != nil {
+					unexpectedErr = fmt.Errorf("on oversize message: %w", err)
+				}
+				return
+			} else if err != nil {
+				unexpectedErr = fmt.Errorf("when reading message: %w", err)
+				return
+			}
+
+			// NOTE(ben): Maybe someday we'll have the textual version of these messages, but for now only
+			// binary is supported.
+			if read.messageType != websocket.BinaryMessage {
+				err := conn.WriteMessage(
+					websocket.BinaryMessage,
+					ErrorMessage("only binary messages are supported"),
+				)
+				if err != nil {
+					unexpectedErr = fmt.Errorf("on non-binary message: %w", err)
+					return
+				}
+				continue
+			}
+
+			err = handleClientMessage(conn, message)
+			if err != nil {
+				unexpectedErr = fmt.Errorf("in handleClientMessage: %w", err)
+				return
+			}
+
+			reads <- readResult{}
 		}
 	}
 }
@@ -173,7 +210,7 @@ func handleClientMessage(conn *websocket.Conn, message []byte) error {
 
 	messageType, err := p.ReadByte()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read message type: %w", err)
 	}
 	switch messageType {
 	default:

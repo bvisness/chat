@@ -34,7 +34,7 @@
   </table>
 
   <script>
-    (async () => {
+    async function test() {
       const { promise: wsReady, resolve: resolveWsReady, reject: rejectWsReady } = Promise.withResolvers();
       const ws = new WebSocket("ws://localhost:8667/events");
       ws.binaryType = "arraybuffer";
@@ -106,7 +106,10 @@
       
       await wsReady;
       send(new Uint8Array([0x00, 0x01, 0x02, 0x03]));
-      setInterval(() => ws.close(), 1000);
-    })();
+      setTimeout(() => ws.close(1000), 2000);
+    };
+
+    test();
+    setTimeout(() => test(), 500);
   </script>
 </body>

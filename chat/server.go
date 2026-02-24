@@ -41,10 +41,18 @@ func Run() {
 		<-signals // First SIGINT (start shutdown)
 		log.Info("Shutting down server (gracefully)")
 
+		// Shut down event streams
+		go func() {
+			// NOTE(ben): This goroutine will go until the process exits, which is fine.
+			for {
+				eventStreamShutdownSignal <- struct{}{}
+			}
+		}()
+
+		// Shut down other web requests
 		go func() {
 			timeoutCtx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
 			defer cancel()
-			shutDownEventStreams = true
 			err := server.Shutdown(timeoutCtx)
 			if err != nil {
 				log.Err("Server did not shut down gracefully", err)
@@ -58,6 +66,7 @@ func Run() {
 	}()
 
 	wg.Wait()
+	eventStreamWaitGroup.Wait()
 	log.Info("Bye bye!")
 }
 

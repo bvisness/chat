@@ -47,6 +47,9 @@ func (c *Request) ErrorResponse(status int, message string) Response {
 	return res
 }
 
+// Returns a pseudo-response telling the request handler that the connection was hijacked, and no
+// further content should be written. Note that requests do not participate in graceful shutdown
+// when this happens, so additional synchronization logic may be needed.
 func (c *Request) Hijacked() Response {
 	return Response{Hijacked: true}
 }

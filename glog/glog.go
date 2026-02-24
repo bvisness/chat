@@ -37,12 +37,24 @@ func (l *Logger) Debug(msg string, fields ...F) {
 	l.Log("DEBUG", msg, fields...)
 }
 
+func (l *Logger) DebugErr(msg string, err error) {
+	l.Debug(msg, F{"err", err})
+}
+
 func (l *Logger) Info(msg string, fields ...F) {
 	l.Log("INFO", msg, fields...)
 }
 
+func (l *Logger) InfoErr(msg string, err error) {
+	l.Info(msg, F{"err", err})
+}
+
 func (l *Logger) Warning(msg string, fields ...F) {
 	l.Log("WARN", msg, fields...)
+}
+
+func (l *Logger) WarningErr(msg string, err error) {
+	l.Warning(msg, F{"err", err})
 }
 
 func (l *Logger) Error(msg string, fields ...F) {
