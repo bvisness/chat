@@ -73,22 +73,23 @@ func hEventStream(c *Request) (res Response) {
 		messageReader io.Reader
 		err           error
 	}
-	reads := make(chan readResult, 1)
+	reads := make(chan readResult)
+	readAgain := make(chan struct{}, 1)
 	defer close(reads)
+	defer close(readAgain)
 	go func() {
 		defer log.Debug("Reader goroutine is shutting down")
 		for {
 			messageType, messageReader, err := conn.NextReader()
 			reads <- readResult{messageType, messageReader, err}
 			if err != nil {
+				defer log.DebugErr("Reader saw error, quitting", err)
 				return
 			}
 
-			// NOTE(ben): We cannot call NextReader again until the main loop is done with the message.
-			// So we just reuse the channel to double as synchronization the other way. When the channel
-			// is closed, we exit.
-			_, goAgain := <-reads
-			if !goAgain {
+			_, ok := <-readAgain
+			if !ok {
+				defer log.Debug("Reader's readAgain channel closed")
 				return
 			}
 		}
@@ -139,68 +140,74 @@ func hEventStream(c *Request) (res Response) {
 			}
 
 		case read := <-reads:
-			if closeError, ok := errors.AsType[*websocket.CloseError](read.err); ok {
-				typicalCodes := []int{websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived}
-				if !slices.Contains(typicalCodes, closeError.Code) {
-					log.Debug("Got unusual close code, does it mean anything?",
+			exit, exitErr := func() (bool, error) {
+				defer func() { readAgain <- struct{}{} }()
+
+				if closeError, ok := errors.AsType[*websocket.CloseError](read.err); ok {
+					typicalCodes := []int{websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived}
+					if !slices.Contains(typicalCodes, closeError.Code) {
+						log.Debug("Got unusual close code, does it mean anything?",
+							glog.F{"code", closeError.Code},
+							glog.F{"reason", closeError.Text},
+						)
+					}
+					log.Debug("Client is closing the WebSocket connection; we will also close and exit",
 						glog.F{"code", closeError.Code},
 						glog.F{"reason", closeError.Text},
 					)
+					// NOTE(ben): gorilla/websocket has a default close handler that responds by echoing the
+					// received close code, which is apparently conventional. So no need to explicitly send our
+					// own close message here.
+					return true, nil
+				} else if errors.Is(read.err, os.ErrDeadlineExceeded) {
+					utils.Assert(state == ESServerClosing, "expected server to be closing, but state was", state)
+					log.Debug("Timed out waiting for client messages while shutting down")
+					return true, nil
+				} else if read.err != nil {
+					return true, fmt.Errorf("on read: %w", read.err)
 				}
-				log.Debug("Client is closing the WebSocket connection; we will also close and exit",
-					glog.F{"code", closeError.Code},
-					glog.F{"reason", closeError.Text},
-				)
-				// NOTE(ben): gorilla/websocket has a default close handler that responds by echoing the
-				// received close code, which is apparently conventional. So no need to explicitly send our
-				// own close message here.
-				return
-			} else if errors.Is(read.err, os.ErrDeadlineExceeded) {
-				utils.Assert(state == ESServerClosing, "expected server to be closing, but state was", state)
-				log.Debug("Timed out waiting for client messages while shutting down")
-				return
-			} else if read.err != nil {
-				unexpectedErr = fmt.Errorf("on read: %w", read.err)
-				return
-			}
 
-			message, err := utils.ReadAllInto(read.messageReader, buf[:])
-			if err == utils.ErrorTooBigForBuffer {
-				log.Warning("Got oversize message, closing connection")
-				err := conn.WriteMessage(
-					websocket.CloseMessage,
-					websocket.FormatCloseMessage(websocket.CloseMessageTooBig, fmt.Sprintf("messages must be at most %d bytes", maxMessageSize)),
-				)
+				message, err := utils.ReadAllInto(read.messageReader, buf[:])
+				if err == utils.ErrorTooBigForBuffer {
+					log.Warning("Got oversize message, closing connection")
+					err := conn.WriteMessage(
+						websocket.CloseMessage,
+						websocket.FormatCloseMessage(websocket.CloseMessageTooBig, fmt.Sprintf("messages must be at most %d bytes", maxMessageSize)),
+					)
+					if err != nil {
+						return true, fmt.Errorf("on oversize message: %w", err)
+					}
+				} else if err != nil {
+					return true, fmt.Errorf("when reading message: %w", err)
+				}
+
+				// NOTE(ben): Maybe someday we'll have the textual version of these messages, but for now
+				// only binary is supported.
+				if read.messageType != websocket.BinaryMessage {
+					err := conn.WriteMessage(
+						websocket.BinaryMessage,
+						ErrorMessage("only binary messages are supported"),
+					)
+					if err != nil {
+						return true, fmt.Errorf("on non-binary message: %w", err)
+					}
+					return false, nil
+				}
+
+				err = handleClientMessage(conn, message)
 				if err != nil {
-					unexpectedErr = fmt.Errorf("on oversize message: %w", err)
+					return true, fmt.Errorf("in handleClientMessage: %w", err)
+				}
+
+				return false, nil
+			}()
+			utils.Assert(!(!exit && exitErr != nil), "saw an exitErr but we weren't exiting")
+			if exit {
+				if exitErr != nil {
+					unexpectedErr = exitErr
 				}
 				return
-			} else if err != nil {
-				unexpectedErr = fmt.Errorf("when reading message: %w", err)
-				return
 			}
-
-			// NOTE(ben): Maybe someday we'll have the textual version of these messages, but for now only
-			// binary is supported.
-			if read.messageType != websocket.BinaryMessage {
-				err := conn.WriteMessage(
-					websocket.BinaryMessage,
-					ErrorMessage("only binary messages are supported"),
-				)
-				if err != nil {
-					unexpectedErr = fmt.Errorf("on non-binary message: %w", err)
-					return
-				}
-				continue
-			}
-
-			err = handleClientMessage(conn, message)
-			if err != nil {
-				unexpectedErr = fmt.Errorf("in handleClientMessage: %w", err)
-				return
-			}
-
-			reads <- readResult{}
 		}
 	}
 }
