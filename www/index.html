@@ -16,25 +16,53 @@
     pre {
       margin: 0;
     }
+
+    .two-wide {
+      display: flex;
+      gap: 1rem;
+
+      > * {
+        flex-basis: 0;
+        flex-grow: 1;
+        flex-shrink: 1;
+      }
+    }
   </style>
 </head>
 
 <body>
   <p>Time to test a server.</p>
-  <table>
-    <thead>
-      <tr>
-        <th>Sent</th>
-        <th>Received</th>
-        <th>Preview</th>
-      </tr>
-    </thead>
-    <tbody id="log">
-    </tbody>
-  </table>
+  <div class="two-wide">
+    <div id="one">
+      <table>
+        <thead>
+          <tr>
+            <th>Sent</th>
+            <th>Received</th>
+            <th>Preview</th>
+          </tr>
+        </thead>
+        <tbody>
+        </tbody>
+      </table>
+    </div>
+    <div id="two">
+      <table>
+        <thead>
+          <tr>
+            <th>Sent</th>
+            <th>Received</th>
+            <th>Preview</th>
+          </tr>
+        </thead>
+        <tbody>
+        </tbody>
+      </table>
+    </div>
+  </div>
 
   <script>
-    async function test() {
+    async function test(logTable) {
       const { promise: wsReady, resolve: resolveWsReady, reject: rejectWsReady } = Promise.withResolvers();
       const ws = new WebSocket("ws://localhost:8667/events");
       ws.binaryType = "arraybuffer";
@@ -89,7 +117,7 @@
         row.appendChild(createLogCell(msg));
         row.appendChild(document.createElement("td"));
         row.appendChild(createHexView(msg));
-        window.log.appendChild(row);
+        logTable.querySelector("tbody").appendChild(row);
         ws.send(msg);
       }
       function receive(msg) {
@@ -97,7 +125,7 @@
         row.appendChild(document.createElement("td"));
         row.appendChild(createLogCell(msg));
         row.appendChild(createHexView(msg));
-        window.log.appendChild(row);
+        logTable.querySelector("tbody").appendChild(row);
       }
 
       ws.addEventListener("message", msg => {
@@ -109,7 +137,7 @@
       setTimeout(() => ws.close(1000), 2000);
     };
 
-    test();
-    setTimeout(() => test(), 500);
+    test(window.one);
+    setTimeout(() => test(window.two), 500);
   </script>
 </body>

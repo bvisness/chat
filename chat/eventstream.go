@@ -9,6 +9,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+	"unicode/utf8"
+	"unsafe"
 
 	"github.com/bvisness/chat/glog"
 	"github.com/bvisness/chat/utils"
@@ -22,6 +24,9 @@ var upgrader = websocket.Upgrader{
 	WriteBufferSize: 4096,
 	// TODO(ben): The Error property here would allow us to send nicer HTTP errors during the
 	// upgrade process. Might be nice.
+	//
+	// ADDENDUM(ben): Ok, but if we just did our own WebSocket impl instead...then we could do
+	// EXACTLY what we wanted and be free of Gorilla's terrible design decisions to boo.
 
 	// TODO(ben): It's not clear to me if we actually care what origin the request comes from. After
 	// all, we might have clients connecting from mobile or other places that wouldn't set an Origin
@@ -95,6 +100,9 @@ func hEventStream(c *Request) (res Response) {
 		}
 	}()
 
+	newEventsToSync := eventNotifications.Subscribe()
+	defer eventNotifications.Unsubscribe(newEventsToSync)
+
 	for {
 		// NOTE(ben): We are going to do a style of closing that is reasonably "clean", at least
 		// according to my interpretation of the WebSocket spec. The general guidance it gives is that
@@ -137,6 +145,26 @@ func hEventStream(c *Request) (res Response) {
 
 				// NOTE(ben): Now we continue to to drain the rest of the queue. We expect to see a close
 				// frame eventually, if the client is well-behaved.
+			}
+
+		case <-newEventsToSync:
+			log.Debug("I heard there were new events to sync...")
+			if state > ESActive {
+				// NOTE(ben): Don't write new messages if we're closing.
+				// TODO(ben): Unless...do we want to send ACKs still? Before closing? Maybe a final ACK
+				// can just be part of the close sequence? Except the client will have already gone into
+				// its close state probably.
+				//
+				// Maybe this whole "drain client messages before quitting" thing is stupid and I should
+				// just hard-abort. What happens if I can't process a message? Who do I send an error to?
+				// Does it make sense to handle messages that I can't ACK? Theoretically the client would
+				// come back later and things would reconcile. And that's probably good, because then even
+				// in the case where the server initiates a shutdown, the messages from the client do get
+				// received and don't need to be retried by the client when the server comes back online.
+				// Overall that seems more reliable. So maybe it's fine. It should be fine in general if
+				// the server handles a message but then the client can't be ACKed. That seems somewhat
+				// obvious. So ok, sure, whatever, I guess. Tomorrow's problem.
+				break
 			}
 
 		case read := <-reads:
@@ -212,19 +240,44 @@ func hEventStream(c *Request) (res Response) {
 	}
 }
 
+// Handles a single WebSocket message from the client. The error return is ONLY for unexpected
+// errors that should terminate the connection.
 func handleClientMessage(conn *websocket.Conn, message []byte) error {
 	p := messageParser{message: message}
 
-	messageType, err := p.ReadByte()
-	if err != nil {
-		return fmt.Errorf("failed to read message type: %w", err)
-	}
-	switch messageType {
-	default:
-		err := conn.WriteMessage(websocket.BinaryMessage, ErrorMessage("unknown message type %v", messageType))
+	nonFatalError := func(msg string, args ...any) error {
+		err := conn.WriteMessage(websocket.BinaryMessage, ErrorMessage(msg, args...))
 		if err != nil {
 			return err
 		}
+		return nil
+	}
+
+	messageType, err := p.ReadByte("message type")
+	if err != nil {
+		return nonFatalError("missing message type")
+	}
+	switch MessageType(messageType) {
+	case MTChatEvent:
+		eventType, err := p.ReadByte("event type")
+		if err != nil {
+			return nonFatalError("missing event type")
+		}
+		switch EventType(eventType) {
+		case ETMessage:
+			text, err := p.ReadUTF8String("message text")
+			if err != nil {
+				return err
+			}
+			newEvents <- Event{
+				Type:        ETMessage,
+				MessageText: text,
+			}
+		default:
+			return nonFatalError("unknown event type %v", eventType)
+		}
+	default:
+		return nonFatalError("unknown message type %v", messageType)
 	}
 
 	return nil
@@ -235,19 +288,42 @@ type messageParser struct {
 	cur     int
 }
 
-func (p *messageParser) ReadByte() (byte, error) {
-	res, err := p.ReadBytes(1)
+func (p *messageParser) ReadByte(thing string) (byte, error) {
+	res, err := p.ReadBytes(1, thing)
 	if err != nil {
 		return 0, err
 	}
 	return res[0], nil
 }
 
-func (p *messageParser) ReadBytes(n int) ([]byte, error) {
+func (p *messageParser) ReadBytes(n int, thing string) ([]byte, error) {
 	if len(p.message[p.cur:]) < n {
-		return nil, io.ErrUnexpectedEOF
+		return nil, fmt.Errorf("parsing %s: %w", io.ErrUnexpectedEOF)
 	}
 	res := p.message[p.cur : p.cur+n]
 	p.cur += n
 	return res, nil
+}
+
+func (p *messageParser) ReadU32(thing string) (uint32, error) {
+	b, err := p.ReadBytes(4, thing)
+	if err != nil {
+		return 0, err
+	}
+	return *(*uint32)(unsafe.Pointer(&b[0])), nil
+}
+
+func (p *messageParser) ReadUTF8String(thing string) (string, error) {
+	n, err := p.ReadU32(thing)
+	if err != nil {
+		return "", err
+	}
+	b, err := p.ReadBytes(int(n), thing)
+	if err != nil {
+		return "", err
+	}
+	if !utf8.Valid(b) {
+		return "", fmt.Errorf("parsing %s: invalid utf-8")
+	}
+	return string(b), nil
 }

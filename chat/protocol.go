@@ -16,11 +16,15 @@ const (
 	ETReply          EventType = 3 // TODO(ben): Seems like this could be a parameter on the message, probably.
 	ETReactionAdd    EventType = 4
 	ETReactionRemove EventType = 5
+
+	ETReserved EventType = 0xFF
 )
 
 type MessageType byte
 
 const (
+	MTChatEvent MessageType = 0x01
+
 	MTError    MessageType = 0xFE
 	MTReserved MessageType = 0xFF
 )
@@ -32,3 +36,8 @@ func ErrorMessage(msg string, args ...any) []byte {
 	copy(res[1:], formatted)
 	return res
 }
+
+// TODO(ben): Whatever the protocol ends up being, I do feel it would be wise to design a binary
+// protocol that is at least a little bit key/value. It would be very useful to be able to create a
+// generic message inspector that could render messages that are well-formed but nonetheless
+// invalid.
