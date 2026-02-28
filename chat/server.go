@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -70,8 +71,10 @@ func Run() {
 	log.Info("Bye bye!")
 }
 
+var requestID atomic.Int64
+
 func mainHandler(rawRes http.ResponseWriter, rawReq *http.Request) {
-	log := log
+	log := log.WithFields(glog.F{"id", requestID.Add(1)})
 
 	var h Handler
 	for _, route := range Routes {
@@ -81,6 +84,8 @@ func mainHandler(rawRes http.ResponseWriter, rawReq *http.Request) {
 			break
 		}
 	}
+	defer log.Recover("Panic in HTTP request")
+
 	if h == nil {
 		// TODO(ben): Nice 404 page
 		rawRes.WriteHeader(404)

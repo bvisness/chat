@@ -9,8 +9,6 @@ import (
 	"slices"
 	"sync"
 	"time"
-	"unicode/utf8"
-	"unsafe"
 
 	"github.com/bvisness/chat/glog"
 	"github.com/bvisness/chat/utils"
@@ -40,6 +38,24 @@ var eventStreamShutdownSignal = make(chan struct{})
 
 const eventStreamShutdownTimeout = 8 * time.Second
 
+type EventStreamSession struct {
+	state           EventStreamState
+	conn            *websocket.Conn
+	clientNeedsSync utils.Waiter
+	clientACK       int64
+
+	unexpectedErr error
+
+	buf [maxMessageSize]byte
+}
+
+type EventStreamState int
+
+const (
+	ESActive EventStreamState = iota
+	ESServerClosing
+)
+
 func hEventStream(c *Request) (res Response) {
 	log := c.Log
 	defer log.Debug("Event stream handler exited")
@@ -50,27 +66,21 @@ func hEventStream(c *Request) (res Response) {
 	// NOTE(ben): We know up front that this is being hijacked, so just set the return value now.
 	res = c.Hijacked()
 
-	conn, err := upgrader.Upgrade(c.RawRes, c.RawReq, nil)
+	var s EventStreamSession
+
+	var err error
+	s.conn, err = upgrader.Upgrade(c.RawRes, c.RawReq, nil)
 	if err != nil {
 		log.Err("Failed to upgrade WebSocket connection", err)
 		return
 	}
-	defer conn.Close() // NOTE(ben): This closes the TCP socket entirely.
+	defer s.conn.Close() // NOTE(ben): This closes the TCP socket entirely.
 
-	var unexpectedErr error
 	defer func() {
-		if unexpectedErr != nil {
-			log.Err("Unexpected fatal error in WebSocket server", unexpectedErr)
+		if s.unexpectedErr != nil {
+			log.Err("Unexpected fatal error in WebSocket server", s.unexpectedErr)
 		}
 	}()
-
-	type EventStreamState int
-	const (
-		ESActive EventStreamState = iota
-		ESServerClosing
-	)
-	state := ESActive
-	var buf [maxMessageSize]byte
 
 	// Background reader: puts WebSocket messages onto a channel.
 	type readResult struct {
@@ -78,14 +88,16 @@ func hEventStream(c *Request) (res Response) {
 		messageReader io.Reader
 		err           error
 	}
-	reads := make(chan readResult)
+	reads := make(chan readResult, 1)
 	readAgain := make(chan struct{}, 1)
 	defer close(reads)
 	defer close(readAgain)
 	go func() {
+		defer log.Recover("Reader goroutine crashed")
 		defer log.Debug("Reader goroutine is shutting down")
+
 		for {
-			messageType, messageReader, err := conn.NextReader()
+			messageType, messageReader, err := s.conn.NextReader()
 			reads <- readResult{messageType, messageReader, err}
 			if err != nil {
 				defer log.DebugErr("Reader saw error, quitting", err)
@@ -100,8 +112,13 @@ func hEventStream(c *Request) (res Response) {
 		}
 	}()
 
-	newEventsToSync := eventNotifications.Subscribe()
-	defer eventNotifications.Unsubscribe(newEventsToSync)
+	s.clientNeedsSync = utils.NewWaiter()
+	defer close(s.clientNeedsSync)
+	newEventNotifications.Subscribe(s.clientNeedsSync)
+	defer newEventNotifications.Unsubscribe(s.clientNeedsSync)
+	s.clientACK = -1
+
+	defer log.Recover("Event stream crashed")
 
 	for {
 		// NOTE(ben): We are going to do a style of closing that is reasonably "clean", at least
@@ -128,18 +145,19 @@ func hEventStream(c *Request) (res Response) {
 		// have our own application-level ACKs that reflect things like, say, persisting events to
 		// disk. All this is just to be nice and minimize confusion and noise on client and server.
 
+	thisiter:
 		select {
 		case <-eventStreamShutdownSignal:
-			if state == ESActive {
-				state = ESServerClosing
-				conn.SetReadDeadline(time.Now().Add(eventStreamShutdownTimeout))
+			if s.state == ESActive {
+				s.state = ESServerClosing
+				s.conn.SetReadDeadline(time.Now().Add(eventStreamShutdownTimeout))
 
-				err := conn.WriteMessage(
+				err := s.conn.WriteMessage(
 					websocket.CloseMessage,
 					websocket.FormatCloseMessage(websocket.CloseGoingAway, "server shutting down"),
 				)
 				if err != nil {
-					unexpectedErr = fmt.Errorf("in shutdown: %w", err)
+					s.unexpectedErr = fmt.Errorf("in shutdown: %w", err)
 					return
 				}
 
@@ -147,24 +165,41 @@ func hEventStream(c *Request) (res Response) {
 				// frame eventually, if the client is well-behaved.
 			}
 
-		case <-newEventsToSync:
-			log.Debug("I heard there were new events to sync...")
-			if state > ESActive {
+		case <-s.clientNeedsSync:
+			if s.state > ESActive {
 				// NOTE(ben): Don't write new messages if we're closing.
-				// TODO(ben): Unless...do we want to send ACKs still? Before closing? Maybe a final ACK
-				// can just be part of the close sequence? Except the client will have already gone into
-				// its close state probably.
-				//
-				// Maybe this whole "drain client messages before quitting" thing is stupid and I should
-				// just hard-abort. What happens if I can't process a message? Who do I send an error to?
-				// Does it make sense to handle messages that I can't ACK? Theoretically the client would
-				// come back later and things would reconcile. And that's probably good, because then even
-				// in the case where the server initiates a shutdown, the messages from the client do get
-				// received and don't need to be retried by the client when the server comes back online.
-				// Overall that seems more reliable. So maybe it's fine. It should be fine in general if
-				// the server handles a message but then the client can't be ACKed. That seems somewhat
-				// obvious. So ok, sure, whatever, I guess. Tomorrow's problem.
-				break
+				break thisiter
+			}
+			EventLog := EventLog // NOTE(ben): Get a stable view of the log
+			latestSN := EventLog[len(EventLog)-1].SN
+			if latestSN < s.clientACK {
+				// NOTE(ben): Impossible ACK from client, indicating misbehavior
+				s.sendErrorToClient("you ACKed %d but %d is the most recent event", s.clientACK, latestSN)
+				return
+			} else if latestSN == s.clientACK {
+				// NOTE(ben): Client is up to date
+				break thisiter
+			}
+
+			// HACK(ben): Abusing the fact that, for now, SN == index in Events
+			for _, event := range EventLog[max(s.clientACK, 0):] {
+				w := messageWriter{buf: s.buf[:]}
+				// NOTE(ben): This should not fail because the buffer should, you know, exist.
+				utils.Must(w.WriteByte(byte(MTEvent), "message type"))
+				if err := event.Serialize(&w); err != nil {
+					s.unexpectedErr = fmt.Errorf("serializing event for client: %w", err)
+					return
+				}
+				if err := s.conn.WriteMessage(websocket.BinaryMessage, w.Bytes()); err != nil {
+					s.unexpectedErr = fmt.Errorf("sending event to client: %w", err)
+					return
+				}
+			}
+
+			// NOTE(ben): Explicitly request an ACK when we are done catching the client up.
+			if err := s.conn.WriteMessage(websocket.BinaryMessage, MessageACKPLZ(s.buf[:])); err != nil {
+				s.unexpectedErr = fmt.Errorf("requesting ACK from client: %w", err)
+				return
 			}
 
 		case read := <-reads:
@@ -188,17 +223,17 @@ func hEventStream(c *Request) (res Response) {
 					// own close message here.
 					return true, nil
 				} else if errors.Is(read.err, os.ErrDeadlineExceeded) {
-					utils.Assert(state == ESServerClosing, "expected server to be closing, but state was", state)
+					utils.Assert(s.state == ESServerClosing, "expected server to be closing, but state was", s.state)
 					log.Debug("Timed out waiting for client messages while shutting down")
 					return true, nil
 				} else if read.err != nil {
 					return true, fmt.Errorf("on read: %w", read.err)
 				}
 
-				message, err := utils.ReadAllInto(read.messageReader, buf[:])
+				message, err := utils.ReadAllInto(read.messageReader, s.buf[:])
 				if err == utils.ErrorTooBigForBuffer {
 					log.Warning("Got oversize message, closing connection")
-					err := conn.WriteMessage(
+					err := s.conn.WriteMessage(
 						websocket.CloseMessage,
 						websocket.FormatCloseMessage(websocket.CloseMessageTooBig, fmt.Sprintf("messages must be at most %d bytes", maxMessageSize)),
 					)
@@ -212,9 +247,9 @@ func hEventStream(c *Request) (res Response) {
 				// NOTE(ben): Maybe someday we'll have the textual version of these messages, but for now
 				// only binary is supported.
 				if read.messageType != websocket.BinaryMessage {
-					err := conn.WriteMessage(
+					err := s.conn.WriteMessage(
 						websocket.BinaryMessage,
-						ErrorMessage("only binary messages are supported"),
+						MessageError(s.buf[:], "only binary messages are supported"),
 					)
 					if err != nil {
 						return true, fmt.Errorf("on non-binary message: %w", err)
@@ -222,7 +257,9 @@ func hEventStream(c *Request) (res Response) {
 					return false, nil
 				}
 
-				err = handleClientMessage(conn, message)
+				// TODO(ben): If many more out-parameters pile up, bundle this together into a struct and
+				// turn the client message thing into a method.
+				err = s.handleClientMessage(message)
 				if err != nil {
 					return true, fmt.Errorf("in handleClientMessage: %w", err)
 				}
@@ -232,7 +269,7 @@ func hEventStream(c *Request) (res Response) {
 			utils.Assert(!(!exit && exitErr != nil), "saw an exitErr but we weren't exiting")
 			if exit {
 				if exitErr != nil {
-					unexpectedErr = exitErr
+					s.unexpectedErr = exitErr
 				}
 				return
 			}
@@ -242,88 +279,56 @@ func hEventStream(c *Request) (res Response) {
 
 // Handles a single WebSocket message from the client. The error return is ONLY for unexpected
 // errors that should terminate the connection.
-func handleClientMessage(conn *websocket.Conn, message []byte) error {
+func (s *EventStreamSession) handleClientMessage(message []byte) error {
 	p := messageParser{message: message}
-
-	nonFatalError := func(msg string, args ...any) error {
-		err := conn.WriteMessage(websocket.BinaryMessage, ErrorMessage(msg, args...))
-		if err != nil {
-			return err
-		}
-		return nil
-	}
 
 	messageType, err := p.ReadByte("message type")
 	if err != nil {
-		return nonFatalError("missing message type")
+		return s.sendErrorToClient("missing message type")
 	}
 	switch MessageType(messageType) {
-	case MTChatEvent:
+	case MTEvent:
 		eventType, err := p.ReadByte("event type")
 		if err != nil {
-			return nonFatalError("missing event type")
+			return s.sendErrorToClient("missing event type")
 		}
 		switch EventType(eventType) {
 		case ETMessage:
 			text, err := p.ReadUTF8String("message text")
 			if err != nil {
-				return err
+				return s.sendErrorToClient("%s", err)
 			}
 			newEvents <- Event{
 				Type:        ETMessage,
 				MessageText: text,
 			}
 		default:
-			return nonFatalError("unknown event type %v", eventType)
+			return s.sendErrorToClient("unknown event type %v", eventType)
 		}
+
+	case MTACK:
+		// Client acknowledging receipt of server events.
+		sn, err := p.ReadS64("client ACK SN")
+		if err != nil {
+			return s.sendErrorToClient("missing SN in client ACK")
+		}
+		if sn < 0 {
+			return s.sendErrorToClient("invalid SN in client ACK")
+		}
+		s.clientACK = sn
+		s.clientNeedsSync.Wake()
+
 	default:
-		return nonFatalError("unknown message type %v", messageType)
+		return s.sendErrorToClient("unknown message type %v", messageType)
 	}
 
 	return nil
 }
 
-type messageParser struct {
-	message []byte
-	cur     int
-}
-
-func (p *messageParser) ReadByte(thing string) (byte, error) {
-	res, err := p.ReadBytes(1, thing)
+func (s *EventStreamSession) sendErrorToClient(msg string, args ...any) error {
+	err := s.conn.WriteMessage(websocket.BinaryMessage, MessageError(s.buf[:], msg, args...))
 	if err != nil {
-		return 0, err
+		return err
 	}
-	return res[0], nil
-}
-
-func (p *messageParser) ReadBytes(n int, thing string) ([]byte, error) {
-	if len(p.message[p.cur:]) < n {
-		return nil, fmt.Errorf("parsing %s: %w", io.ErrUnexpectedEOF)
-	}
-	res := p.message[p.cur : p.cur+n]
-	p.cur += n
-	return res, nil
-}
-
-func (p *messageParser) ReadU32(thing string) (uint32, error) {
-	b, err := p.ReadBytes(4, thing)
-	if err != nil {
-		return 0, err
-	}
-	return *(*uint32)(unsafe.Pointer(&b[0])), nil
-}
-
-func (p *messageParser) ReadUTF8String(thing string) (string, error) {
-	n, err := p.ReadU32(thing)
-	if err != nil {
-		return "", err
-	}
-	b, err := p.ReadBytes(int(n), thing)
-	if err != nil {
-		return "", err
-	}
-	if !utf8.Valid(b) {
-		return "", fmt.Errorf("parsing %s: invalid utf-8")
-	}
-	return string(b), nil
+	return nil
 }

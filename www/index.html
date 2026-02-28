@@ -133,7 +133,12 @@
       });
       
       await wsReady;
-      send(new Uint8Array([0x00, 0x01, 0x02, 0x03]));
+      send(new Uint8Array([
+        0x01, // MTChatMessage
+        0x00, // ETMessage
+        0x05, 0x00, 0x00, 0x00, // 5 letters
+        0x68, 0x65, 0x6C, 0x6C, 0x6F, // hello
+      ]));
       setTimeout(() => ws.close(1000), 2000);
     };
 

@@ -1,7 +1,6 @@
 package utils
 
 import (
-	"cmp"
 	"fmt"
 )
 
@@ -55,18 +54,4 @@ func Must2[T1 any, T2 any, E comparableError](v1 T1, v2 T2, err E) (T1, T2) {
 		panic(err)
 	}
 	return v1, v2
-}
-
-func Min[T cmp.Ordered](a, b T) T {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func Max[T cmp.Ordered](a, b T) T {
-	if a > b {
-		return a
-	}
-	return b
 }

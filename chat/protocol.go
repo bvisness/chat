@@ -1,6 +1,10 @@
 package chat
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/bvisness/chat/utils"
+)
 
 // ============================================================================
 // Everything here is heavily based on aolo2's chat program:
@@ -23,18 +27,29 @@ const (
 type MessageType byte
 
 const (
-	MTChatEvent MessageType = 0x01
+	// Initial transmission or retransmission of a persistent event.
+	MTEvent MessageType = 0x01
+
+	// Acknowledging receipt of all events up to a particular SN.
+	MTACK MessageType = 0x80
+	// Explicitly requesting an ACK from the other side.
+	MTACKPLZ MessageType = 0x81
 
 	MTError    MessageType = 0xFE
 	MTReserved MessageType = 0xFF
 )
 
-func ErrorMessage(msg string, args ...any) []byte {
-	formatted := fmt.Sprintf(msg, args...)
-	res := make([]byte, 1+len(formatted))
-	res[0] = byte(MTError)
-	copy(res[1:], formatted)
-	return res
+func MessageACKPLZ(buf []byte) []byte {
+	w := messageWriter{buf: buf}
+	utils.Must(w.WriteByte(byte(MTACKPLZ), "message type"))
+	return w.Bytes()
+}
+
+func MessageError(buf []byte, msg string, args ...any) []byte {
+	w := messageWriter{buf: buf}
+	utils.Must(w.WriteByte(byte(MTError), "message type"))
+	utils.Must(w.WriteString(fmt.Sprintf(msg, args...), "error message"))
+	return w.Bytes()
 }
 
 // TODO(ben): Whatever the protocol ends up being, I do feel it would be wise to design a binary
