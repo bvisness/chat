@@ -3,6 +3,10 @@
 <head>
   <title>WebSocket Test</title>
   <style>
+    * {
+      box-sizing: border-box;
+    }
+
     table {
       border-collapse: collapse;
     }
@@ -27,6 +31,30 @@
         flex-shrink: 1;
       }
     }
+
+    .chat {
+      width: 20rem;
+      margin-bottom: 1rem;
+      height: 16rem;
+      display: flex;
+      flex-direction: column;
+      border: 1px solid black;
+
+      .log {
+        flex-grow: 1;
+        overflow-y: scroll;
+
+        div {
+          padding: 0.1rem 0.25rem;
+        }
+      }
+
+      input {
+        /* width: 100%; */
+        flex-shrink: 0;
+        margin: 2px;
+      }
+    }
   </style>
 </head>
 
@@ -34,6 +62,10 @@
   <p>Time to test a server.</p>
   <div class="two-wide">
     <div id="one">
+      <div class="chat">
+        <div class="log"></div>
+        <input type="text">
+      </div>
       <table>
         <thead>
           <tr>
@@ -47,6 +79,10 @@
       </table>
     </div>
     <div id="two">
+      <div class="chat">
+        <div class="log"></div>
+        <input type="text">
+      </div>
       <table>
         <thead>
           <tr>
@@ -62,7 +98,10 @@
   </div>
 
   <script>
-    async function test(logTable) {
+    async function test(container) {
+      const input = container.querySelector("input");
+      const log = container.querySelector(".log");
+
       const { promise: wsReady, resolve: resolveWsReady, reject: rejectWsReady } = Promise.withResolvers();
       const ws = new WebSocket("ws://localhost:8667/events");
       ws.binaryType = "arraybuffer";
@@ -112,12 +151,14 @@
         td.appendChild(pre);
         return td;
       }
+
+      let latestServerSN = -1n;
       function send(msg) {
         const row = document.createElement("tr");
         row.appendChild(createLogCell(msg));
         row.appendChild(document.createElement("td"));
         row.appendChild(createHexView(msg));
-        logTable.querySelector("tbody").appendChild(row);
+        container.querySelector("tbody").appendChild(row);
         ws.send(msg);
       }
       function receive(msg) {
@@ -125,21 +166,75 @@
         row.appendChild(document.createElement("td"));
         row.appendChild(createLogCell(msg));
         row.appendChild(createHexView(msg));
-        logTable.querySelector("tbody").appendChild(row);
+        container.querySelector("tbody").appendChild(row);
+
+        switch (msg[0]) {
+        case 0x01: { // MTEvent
+          const sn = new DataView(msg.buffer).getBigInt64(1, true);
+          const eventType = new DataView(msg.buffer).getUint8(1+8);
+          console.log(`Latest server SN is ${sn} (was ${latestServerSN})`);
+          latestServerSN = sn;
+          // TODO(ben): ACK periodically while receiving normal messages, before receiving
+          // an ACKPLZ
+
+          switch (eventType) {
+          case 0: { // ETMessage
+            const textLength = new DataView(msg.buffer).getUint32(1+8+1, true);
+            const text = new TextDecoder().decode(msg.subarray(1+8+1+4, 1+8+1+4+textLength));
+
+            const row = document.createElement("div");
+            row.innerText = text;
+            log.appendChild(row);
+            row.scrollIntoView({ behavior: "instant", block: "end" });
+          } break;
+          }
+        } break;
+        case 0x81: { // MTACKPLZ
+          const ack = new Uint8Array([
+            0x80, // MTACK
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Dummy SN
+          ]);
+          new DataView(ack.buffer).setBigInt64(1, BigInt(latestServerSN), true);
+          send(ack);
+        } break;
+        }
       }
 
       ws.addEventListener("message", msg => {
         receive(new Uint8Array(msg.data));
       });
+
+      input.addEventListener("keydown", e => {
+        if (e.key === "Enter") {
+          let text = input.value.trim();
+          if (text.length > 0) {
+            const textBytes = new TextEncoder().encode(text);
+            // TODO(ben): Enforce a max length that fits the max message size
+            const msg = new Uint8Array(1 + 1 + 4 + textBytes.length);
+            // TODO(ben): This is just super wrong now because it doesn't have an SN. Protocols for
+            // me for not for thee!!
+            new DataView(msg.buffer).setUint8(0, 0x01); // MTEvent
+            new DataView(msg.buffer).setUint8(1, 0x00); // ETMessage
+            new DataView(msg.buffer).setUint32(2, textBytes.length, true);
+            msg.set(textBytes, 6);
+            send(msg);
+            input.value = "";
+          }
+        }
+      });
       
       await wsReady;
       send(new Uint8Array([
-        0x01, // MTChatMessage
-        0x00, // ETMessage
-        0x05, 0x00, 0x00, 0x00, // 5 letters
-        0x68, 0x65, 0x6C, 0x6C, 0x6F, // hello
+        0x80, // MTACK
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // -1
       ]));
-      setTimeout(() => ws.close(1000), 2000);
+      // send(new Uint8Array([
+      //   0x01, // MTChatMessage
+      //   0x00, // ETMessage
+      //   0x05, 0x00, 0x00, 0x00, // 5 letters
+      //   0x68, 0x65, 0x6C, 0x6C, 0x6F, // hello
+      // ]));
+      // setTimeout(() => ws.close(1000), 2000);
     };
 
     test(window.one);

@@ -171,6 +171,9 @@ func hEventStream(c *Request) (res Response) {
 				break thisiter
 			}
 			EventLog := EventLog // NOTE(ben): Get a stable view of the log
+			if len(EventLog) == 0 {
+				break thisiter
+			}
 			latestSN := EventLog[len(EventLog)-1].SN
 			if latestSN < s.clientACK {
 				// NOTE(ben): Impossible ACK from client, indicating misbehavior
@@ -182,7 +185,7 @@ func hEventStream(c *Request) (res Response) {
 			}
 
 			// HACK(ben): Abusing the fact that, for now, SN == index in Events
-			for _, event := range EventLog[max(s.clientACK, 0):] {
+			for _, event := range EventLog[s.clientACK+1:] {
 				w := messageWriter{buf: s.buf[:]}
 				// NOTE(ben): This should not fail because the buffer should, you know, exist.
 				utils.Must(w.WriteByte(byte(MTEvent), "message type"))
@@ -312,10 +315,7 @@ func (s *EventStreamSession) handleClientMessage(message []byte) error {
 		if err != nil {
 			return s.sendErrorToClient("missing SN in client ACK")
 		}
-		if sn < 0 {
-			return s.sendErrorToClient("invalid SN in client ACK")
-		}
-		s.clientACK = sn
+		s.clientACK = max(sn, -1) // NOTE(ben): -1 is reserved as having ACKed nothing
 		s.clientNeedsSync.Wake()
 
 	default:

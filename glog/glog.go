@@ -11,10 +11,12 @@ import (
 var mu sync.Mutex
 
 func lockAndUnlock() func() {
-	mu.Lock()
-	return func() {
-		mu.Unlock()
-	}
+	// TODO(ben): This seems to have caused hangs. Dumb.
+	// mu.Lock()
+	// return func() {
+	// 	mu.Unlock()
+	// }
+	return func() {}
 }
 
 type Logger struct {
