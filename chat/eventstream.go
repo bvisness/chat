@@ -188,7 +188,7 @@ func hEventStream(c *Request) (res Response) {
 			for _, event := range EventLog[s.clientACK+1:] {
 				w := messageWriter{buf: s.buf[:]}
 				// NOTE(ben): This should not fail because the buffer should, you know, exist.
-				utils.Must(w.WriteByte(byte(MTEvent), "message type"))
+				utils.Must(w.WriteByte(byte(MTPersistentEvent), "message type"))
 				if err := event.Serialize(&w); err != nil {
 					s.unexpectedErr = fmt.Errorf("serializing event for client: %w", err)
 					return
@@ -290,7 +290,7 @@ func (s *EventStreamSession) handleClientMessage(message []byte) error {
 		return s.sendErrorToClient("missing message type")
 	}
 	switch MessageType(messageType) {
-	case MTEvent:
+	case MTPersistentEvent:
 		eventType, err := p.ReadByte("event type")
 		if err != nil {
 			return s.sendErrorToClient("missing event type")
