@@ -9,7 +9,7 @@ type Event struct {
 	// universally recognized and shared across all clients and also serves as a unique ID for the
 	// event.
 	SN   int64
-	Type EventType
+	Type RecordType
 
 	// Message properties
 	MessageText string
@@ -24,7 +24,7 @@ func (e *Event) Serialize(w *messageWriter) error {
 	}
 
 	switch e.Type {
-	case ETMessage:
+	case RTMessage:
 		if err := w.WriteString(e.MessageText, "message text"); err != nil {
 			return err
 		}

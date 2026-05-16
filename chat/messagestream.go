@@ -24,7 +24,7 @@ var upgrader = websocket.Upgrader{
 	// upgrade process. Might be nice.
 	//
 	// ADDENDUM(ben): Ok, but if we just did our own WebSocket impl instead...then we could do
-	// EXACTLY what we wanted and be free of Gorilla's terrible design decisions to boo.
+	// EXACTLY what we wanted and be free of Gorilla's terrible design decisions to boot.
 
 	// TODO(ben): It's not clear to me if we actually care what origin the request comes from. After
 	// all, we might have clients connecting from mobile or other places that wouldn't set an Origin
@@ -188,7 +188,7 @@ func hEventStream(c *Request) (res Response) {
 			for _, event := range EventLog[s.clientACK+1:] {
 				w := messageWriter{buf: s.buf[:]}
 				// NOTE(ben): This should not fail because the buffer should, you know, exist.
-				utils.Must(w.WriteByte(byte(MTPersistentEvent), "message type"))
+				utils.Must(w.WriteByte(byte(ETRecord), "message type"))
 				if err := event.Serialize(&w); err != nil {
 					s.unexpectedErr = fmt.Errorf("serializing event for client: %w", err)
 					return
@@ -200,7 +200,7 @@ func hEventStream(c *Request) (res Response) {
 			}
 
 			// NOTE(ben): Explicitly request an ACK when we are done catching the client up.
-			if err := s.conn.WriteMessage(websocket.BinaryMessage, MessageACKPLZ(s.buf[:])); err != nil {
+			if err := s.conn.WriteMessage(websocket.BinaryMessage, CreateSYNEvent(s.buf[:])); err != nil {
 				s.unexpectedErr = fmt.Errorf("requesting ACK from client: %w", err)
 				return
 			}
@@ -252,7 +252,7 @@ func hEventStream(c *Request) (res Response) {
 				if read.messageType != websocket.BinaryMessage {
 					err := s.conn.WriteMessage(
 						websocket.BinaryMessage,
-						MessageError(s.buf[:], "only binary messages are supported"),
+						CreateErrorEvent(s.buf[:], "only binary messages are supported"),
 					)
 					if err != nil {
 						return true, fmt.Errorf("on non-binary message: %w", err)
@@ -289,25 +289,9 @@ func (s *EventStreamSession) handleClientMessage(message []byte) error {
 	if err != nil {
 		return s.sendErrorToClient("missing message type")
 	}
-	switch MessageType(messageType) {
-	case MTPersistentEvent:
-		eventType, err := p.ReadByte("event type")
-		if err != nil {
-			return s.sendErrorToClient("missing event type")
-		}
-		switch EventType(eventType) {
-		case ETMessage:
-			text, err := p.ReadUTF8String("message text")
-			if err != nil {
-				return s.sendErrorToClient("%s", err)
-			}
-			newEvents <- Event{
-				Type:        ETMessage,
-				MessageText: text,
-			}
-		default:
-			return s.sendErrorToClient("unknown event type %v", eventType)
-		}
+	switch EventType(messageType) {
+	case ETRecord:
+		handleClientRecord
 
 	case MTACK:
 		// Client acknowledging receipt of server events.
@@ -325,8 +309,28 @@ func (s *EventStreamSession) handleClientMessage(message []byte) error {
 	return nil
 }
 
+func (s *EventStreamSession) handleClientRecord() error {
+	recordType, err := p.ReadByte("record type")
+	if err != nil {
+		return s.sendErrorToClient("missing event type")
+	}
+	switch RecordType(recordType) {
+	case RTMessage:
+		text, err := p.ReadUTF8String("message text")
+		if err != nil {
+			return s.sendErrorToClient("%s", err)
+		}
+		newEvents <- Event{
+			Type:        RTMessage,
+			MessageText: text,
+		}
+	default:
+		return s.sendErrorToClient("unknown event type %v", recordType)
+	}
+}
+
 func (s *EventStreamSession) sendErrorToClient(msg string, args ...any) error {
-	err := s.conn.WriteMessage(websocket.BinaryMessage, MessageError(s.buf[:], msg, args...))
+	err := s.conn.WriteMessage(websocket.BinaryMessage, CreateErrorEvent(s.buf[:], msg, args...))
 	if err != nil {
 		return err
 	}
