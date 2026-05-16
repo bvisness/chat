@@ -33,8 +33,8 @@ type EventType byte
 const (
 	ETRecord EventType = 0x01
 
-	ETSYN  EventType = 0x10
-	ETACKK EventType = 0x11
+	ETSYN EventType = 0x10
+	ETACK EventType = 0x11
 
 	ETTyping         EventType = 0x20
 	ETPresenceUpdate EventType = 0x21
@@ -48,13 +48,13 @@ const (
 )
 
 func CreateSYNEvent(buf []byte) []byte {
-	w := messageWriter{buf: buf}
+	w := eventWriter{buf: buf}
 	utils.Must(w.WriteByte(byte(ETSYN), "message type"))
 	return w.Bytes()
 }
 
 func CreateErrorEvent(buf []byte, msg string, args ...any) []byte {
-	w := messageWriter{buf: buf}
+	w := eventWriter{buf: buf}
 	utils.Must(w.WriteByte(byte(ETError), "message type"))
 	utils.Must(w.WriteString(fmt.Sprintf(msg, args...), "error message"))
 	return w.Bytes()

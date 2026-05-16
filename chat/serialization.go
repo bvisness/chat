@@ -10,12 +10,12 @@ import (
 	"github.com/bvisness/chat/utils"
 )
 
-type messageParser struct {
-	message []byte
-	cur     int
+type eventParser struct {
+	data []byte
+	cur  int
 }
 
-func (p *messageParser) ReadByte(thing string) (byte, error) {
+func (p *eventParser) ReadByte(thing string) (byte, error) {
 	res, err := p.ReadBytes(1, thing)
 	if err != nil {
 		return 0, err
@@ -23,16 +23,16 @@ func (p *messageParser) ReadByte(thing string) (byte, error) {
 	return res[0], nil
 }
 
-func (p *messageParser) ReadBytes(n int, thing string) ([]byte, error) {
-	if len(p.message[p.cur:]) < n {
+func (p *eventParser) ReadBytes(n int, thing string) ([]byte, error) {
+	if len(p.data[p.cur:]) < n {
 		return nil, fmt.Errorf("parsing %s: %w", thing, io.ErrUnexpectedEOF)
 	}
-	res := p.message[p.cur : p.cur+n]
+	res := p.data[p.cur : p.cur+n]
 	p.cur += n
 	return res, nil
 }
 
-func (p *messageParser) ReadU32(thing string) (uint32, error) {
+func (p *eventParser) ReadU32(thing string) (uint32, error) {
 	b, err := p.ReadBytes(4, thing)
 	if err != nil {
 		return 0, err
@@ -40,7 +40,7 @@ func (p *messageParser) ReadU32(thing string) (uint32, error) {
 	return binary.LittleEndian.Uint32(b), nil
 }
 
-func (p *messageParser) ReadS64(thing string) (int64, error) {
+func (p *eventParser) ReadS64(thing string) (int64, error) {
 	b, err := p.ReadBytes(8, thing)
 	if err != nil {
 		return 0, err
@@ -48,7 +48,7 @@ func (p *messageParser) ReadS64(thing string) (int64, error) {
 	return int64(binary.LittleEndian.Uint64(b)), nil
 }
 
-func (p *messageParser) ReadUTF8String(thing string) (string, error) {
+func (p *eventParser) ReadUTF8String(thing string) (string, error) {
 	n, err := p.ReadU32(thing)
 	if err != nil {
 		return "", err
@@ -63,23 +63,23 @@ func (p *messageParser) ReadUTF8String(thing string) (string, error) {
 	return string(b), nil
 }
 
-type messageWriter struct {
+type eventWriter struct {
 	buf []byte
 	cur int
 }
 
-func (w *messageWriter) Check(nBytes int, thing string) error {
+func (w *eventWriter) Check(nBytes int, thing string) error {
 	if len(w.buf[w.cur:]) < nBytes {
 		return fmt.Errorf("writing %s: %w", thing, io.ErrUnexpectedEOF)
 	}
 	return nil
 }
 
-func (w *messageWriter) Bytes() []byte {
+func (w *eventWriter) Bytes() []byte {
 	return w.buf[:w.cur]
 }
 
-func (w *messageWriter) WriteByte(v byte, thing string) error {
+func (w *eventWriter) WriteByte(v byte, thing string) error {
 	if err := w.Check(1, thing); err != nil {
 		return err
 	}
@@ -88,7 +88,7 @@ func (w *messageWriter) WriteByte(v byte, thing string) error {
 	return nil
 }
 
-func (w *messageWriter) WriteBytes(v []byte, thing string) error {
+func (w *eventWriter) WriteBytes(v []byte, thing string) error {
 	if err := w.Check(len(v), thing); err != nil {
 		return err
 	}
@@ -98,7 +98,7 @@ func (w *messageWriter) WriteBytes(v []byte, thing string) error {
 	return nil
 }
 
-func (w *messageWriter) WriteU32(v uint32, thing string) error {
+func (w *eventWriter) WriteU32(v uint32, thing string) error {
 	if err := w.Check(4, thing); err != nil {
 		return err
 	}
@@ -107,7 +107,7 @@ func (w *messageWriter) WriteU32(v uint32, thing string) error {
 	return nil
 }
 
-func (w *messageWriter) WriteS64(v int64, thing string) error {
+func (w *eventWriter) WriteS64(v int64, thing string) error {
 	if err := w.Check(8, thing); err != nil {
 		return err
 	}
@@ -116,7 +116,7 @@ func (w *messageWriter) WriteS64(v int64, thing string) error {
 	return nil
 }
 
-func (w *messageWriter) WriteString(v string, thing string) error {
+func (w *eventWriter) WriteString(v string, thing string) error {
 	utils.Assert(len(v) < math.MaxUint32)
 	if err := w.WriteU32(uint32(len(v)), thing+" length"); err != nil {
 		return err

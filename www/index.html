@@ -103,7 +103,7 @@
       const log = container.querySelector(".log");
 
       const { promise: wsReady, resolve: resolveWsReady, reject: rejectWsReady } = Promise.withResolvers();
-      const ws = new WebSocket("ws://localhost:8667/events");
+      const ws = new WebSocket("ws://localhost:8667/api/events");
       ws.binaryType = "arraybuffer";
 
       ws.addEventListener("open", () => {

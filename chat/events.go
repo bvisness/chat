@@ -15,7 +15,7 @@ type Event struct {
 	MessageText string
 }
 
-func (e *Event) Serialize(w *messageWriter) error {
+func (e *Event) Serialize(w *eventWriter) error {
 	if err := w.WriteS64(e.SN, "SN"); err != nil {
 		return err
 	}

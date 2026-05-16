@@ -186,7 +186,7 @@ func hEventStream(c *Request) (res Response) {
 
 			// HACK(ben): Abusing the fact that, for now, SN == index in Events
 			for _, event := range EventLog[s.clientACK+1:] {
-				w := messageWriter{buf: s.buf[:]}
+				w := eventWriter{buf: s.buf[:]}
 				// NOTE(ben): This should not fail because the buffer should, you know, exist.
 				utils.Must(w.WriteByte(byte(ETRecord), "message type"))
 				if err := event.Serialize(&w); err != nil {
@@ -227,24 +227,24 @@ func hEventStream(c *Request) (res Response) {
 					return true, nil
 				} else if errors.Is(read.err, os.ErrDeadlineExceeded) {
 					utils.Assert(s.state == ESServerClosing, "expected server to be closing, but state was", s.state)
-					log.Debug("Timed out waiting for client messages while shutting down")
+					log.Debug("Timed out waiting for client ws messages while shutting down")
 					return true, nil
 				} else if read.err != nil {
 					return true, fmt.Errorf("on read: %w", read.err)
 				}
 
-				message, err := utils.ReadAllInto(read.messageReader, s.buf[:])
+				event, err := utils.ReadAllInto(read.messageReader, s.buf[:])
 				if err == utils.ErrorTooBigForBuffer {
-					log.Warning("Got oversize message, closing connection")
+					log.Warning("Got oversize ws message, closing connection")
 					err := s.conn.WriteMessage(
 						websocket.CloseMessage,
-						websocket.FormatCloseMessage(websocket.CloseMessageTooBig, fmt.Sprintf("messages must be at most %d bytes", maxMessageSize)),
+						websocket.FormatCloseMessage(websocket.CloseMessageTooBig, fmt.Sprintf("ws messages must be at most %d bytes", maxMessageSize)),
 					)
 					if err != nil {
-						return true, fmt.Errorf("on oversize message: %w", err)
+						return true, fmt.Errorf("on oversize ws message: %w", err)
 					}
 				} else if err != nil {
-					return true, fmt.Errorf("when reading message: %w", err)
+					return true, fmt.Errorf("when reading ws message: %w", err)
 				}
 
 				// NOTE(ben): Maybe someday we'll have the textual version of these messages, but for now
@@ -252,18 +252,15 @@ func hEventStream(c *Request) (res Response) {
 				if read.messageType != websocket.BinaryMessage {
 					err := s.conn.WriteMessage(
 						websocket.BinaryMessage,
-						CreateErrorEvent(s.buf[:], "only binary messages are supported"),
+						CreateErrorEvent(s.buf[:], "only binary ws messages are supported"),
 					)
 					if err != nil {
-						return true, fmt.Errorf("on non-binary message: %w", err)
+						return true, fmt.Errorf("on non-binary ws message: %w", err)
 					}
 					return false, nil
 				}
 
-				// TODO(ben): If many more out-parameters pile up, bundle this together into a struct and
-				// turn the client message thing into a method.
-				err = s.handleClientMessage(message)
-				if err != nil {
+				if err := s.handleClientEvent(event); err != nil {
 					return true, fmt.Errorf("in handleClientMessage: %w", err)
 				}
 
@@ -282,18 +279,18 @@ func hEventStream(c *Request) (res Response) {
 
 // Handles a single WebSocket message from the client. The error return is ONLY for unexpected
 // errors that should terminate the connection.
-func (s *EventStreamSession) handleClientMessage(message []byte) error {
-	p := messageParser{message: message}
+func (s *EventStreamSession) handleClientEvent(eventData []byte) error {
+	p := &eventParser{data: eventData}
 
-	messageType, err := p.ReadByte("message type")
+	eventType, err := p.ReadByte("event type")
 	if err != nil {
-		return s.sendErrorToClient("missing message type")
+		return s.sendErrorToClient("missing event type")
 	}
-	switch EventType(messageType) {
+	switch EventType(eventType) {
 	case ETRecord:
-		handleClientRecord
+		s.handleClientRecord(p)
 
-	case MTACK:
+	case ETACK:
 		// Client acknowledging receipt of server events.
 		sn, err := p.ReadS64("client ACK SN")
 		if err != nil {
@@ -303,13 +300,13 @@ func (s *EventStreamSession) handleClientMessage(message []byte) error {
 		s.clientNeedsSync.Wake()
 
 	default:
-		return s.sendErrorToClient("unknown message type %v", messageType)
+		return s.sendErrorToClient("unknown event type %v", eventType)
 	}
 
 	return nil
 }
 
-func (s *EventStreamSession) handleClientRecord() error {
+func (s *EventStreamSession) handleClientRecord(p *eventParser) error {
 	recordType, err := p.ReadByte("record type")
 	if err != nil {
 		return s.sendErrorToClient("missing event type")
@@ -327,6 +324,8 @@ func (s *EventStreamSession) handleClientRecord() error {
 	default:
 		return s.sendErrorToClient("unknown event type %v", recordType)
 	}
+
+	return nil
 }
 
 func (s *EventStreamSession) sendErrorToClient(msg string, args ...any) error {

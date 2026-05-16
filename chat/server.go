@@ -87,8 +87,7 @@ func mainHandler(rawRes http.ResponseWriter, rawReq *http.Request) {
 	defer log.Recover("Panic in HTTP request")
 
 	if h == nil {
-		// TODO(ben): Nice 404 page
-		rawRes.WriteHeader(404)
+		serveStaticFiles(rawRes, rawReq)
 		return
 	}
 
@@ -117,4 +116,10 @@ func mainHandler(rawRes http.ResponseWriter, rawReq *http.Request) {
 	} else if err != nil {
 		log.Err("Failed to write response", err)
 	}
+}
+
+var wwwHandler = http.FileServer(http.Dir("www"))
+
+func serveStaticFiles(rawRes http.ResponseWriter, rawReq *http.Request) {
+	wwwHandler.ServeHTTP(rawRes, rawReq)
 }
