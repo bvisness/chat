@@ -3,6 +3,7 @@
 package sqlite
 
 import (
+	"context"
 	"database/sql"
 	"reflect"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/bvisness/chat/db"
 	"github.com/bvisness/chat/utils"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -81,4 +83,104 @@ func assertEquivalent[T any](t *testing.T, conn *sql.DB, query string, goValue a
 	t.Logf("  Error 2: %v", err2)
 	require.Equal(t, dest1, dest2)
 	require.Equal(t, err1 == nil, err2 == nil)
+}
+
+func TestIntegration(t *testing.T) {
+	type Identifiable struct {
+		ID int `db:"id"`
+	}
+	type Asset struct {
+		Hash string `db:"hash"`
+	}
+	type User struct {
+		Identifiable
+		Name          string  `db:"name"`
+		Nickname      *string `db:"nickname"`
+		ProfilePicID  int     `db:"profile_pic_id"`
+		BannerImageID *int    `db:"banner_img_id"`
+	}
+
+	conn := utils.Must1(sql.Open("sqlite3", ":memory:"))
+	utils.Must1(conn.Exec(`
+		CREATE TABLE asset (
+			id                INTEGER PRIMARY KEY,
+			hash              TEXT NOT NULL
+		);
+		CREATE TABLE user (
+			id                TEXT PRIMARY KEY,
+			name              TEXT NOT NULL,
+			nickname          TEXT,
+			profile_pic_id    INTEGER NOT NULL REFERENCES asset(id), 
+			banner_img_id     INTEGER  				 REFERENCES asset(id)
+		);
+		INSERT INTO asset(id, hash) VALUES
+			(1, '600df00d'),
+			(2, 'baadf00d'),
+			(3, 'deadbeef');
+		INSERT INTO user(id, name, nickname, profile_pic_id, banner_img_id) VALUES
+			(1, 'Alice', NULL, 1, NULL),
+			(2, 'Bob', 'Robert', 2, 3);
+	`))
+
+	t.Run("single table", func(t *testing.T) {
+		users, err := db.Query[User](context.Background(), conn, `SELECT $columns FROM user`)
+		require.Nil(t, err)
+		assert.Equal(t, []*User{
+			{
+				Identifiable: Identifiable{1},
+				Name:         "Alice",
+				ProfilePicID: 1,
+			},
+			{
+				Identifiable:  Identifiable{2},
+				Name:          "Bob",
+				Nickname:      new("Robert"),
+				ProfilePicID:  2,
+				BannerImageID: new(3),
+			},
+		}, users)
+	})
+
+	t.Run("joins", func(t *testing.T) {
+		type userAndAssets struct {
+			User       User   `db:"user"`
+			ProfilePic Asset  `db:"profile_pic"`
+			BannerImg  *Asset `db:"banner_img"`
+		}
+		usersWithAssets, err := db.Query[userAndAssets](context.Background(), conn, `
+			SELECT $columns
+			FROM
+				user
+				LEFT JOIN asset AS profile_pic ON user.profile_pic_id = profile_pic.id
+				LEFT JOIN asset AS banner_img ON user.banner_img_id = banner_img.id
+		`)
+		require.Nil(t, err)
+		assert.Equal(t, []*userAndAssets{
+			{
+				User: User{
+					Identifiable: Identifiable{1},
+					Name:         "Alice",
+					ProfilePicID: 1,
+				},
+				ProfilePic: Asset{
+					Hash: "600df00d",
+				},
+			},
+			{
+				User: User{
+					Identifiable:  Identifiable{2},
+					Name:          "Bob",
+					Nickname:      new("Robert"),
+					ProfilePicID:  2,
+					BannerImageID: new(3),
+				},
+				ProfilePic: Asset{
+					Hash: "baadf00d",
+				},
+				BannerImg: &Asset{
+					Hash: "deadbeef",
+				},
+			},
+		}, usersWithAssets)
+	})
 }

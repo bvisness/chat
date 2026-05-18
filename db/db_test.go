@@ -306,24 +306,58 @@ func TestDBFields(t *testing.T) {
 		G int `db:"g"`
 	}
 	type Inner3 struct {
-		F int `db:"f"`
-		Inner4
+		F      int `db:"f"`
+		Inner4 `db:"inner4"`
+	}
+	type Inner5 struct {
+		H int `db:"h"`
 	}
 	type s struct {
 		A      int    `db:"a"`
-		B      int    // no tag
-		c      int    `db:"c"` // not exported
+		B      int    // no tag, ignored
+		c      int    `db:"c"` // not exported, ignored
 		Inner1 Inner1 `db:"inner1"`
 		Inner2 `db:"inner2"`
 		Inner3 `db:"inner3"`
+		Inner5 // no tag, contents still included
 	}
 
 	fields := slices.Collect(dbFields(reflect.TypeFor[s]()))
 	t.Log(fields)
-	require.Len(t, fields, 5)
+	require.Len(t, fields, 6)
 	assert.Equal(t, "A", fields[0].Name)
 	assert.Equal(t, "Inner1", fields[1].Name)
 	assert.Equal(t, "E", fields[2].Name)
 	assert.Equal(t, "F", fields[3].Name)
 	assert.Equal(t, "G", fields[4].Name)
+	assert.Equal(t, "H", fields[5].Name)
+}
+
+func TestCompileQuery(t *testing.T) {
+	type Identifiable struct {
+		ID string `db:"id"`
+	}
+	type Asset struct {
+		Hash string `db:"hash"`
+	}
+	type User struct {
+		Identifiable
+		Name           string  `db:"name"`
+		Nickname       *string `db:"nickname"`
+		ProfilePicture Asset   `db:"profile_pic"`
+		BannerImage    *Asset  `db:"banner_img"`
+	}
+
+	assert.Equal(t,
+		len(generateScanArgs(&User{})),
+		len(getColumnNames(reflect.TypeFor[User](), nil)),
+	)
+	assert.Equal(t,
+		`SELECT id, name, nickname, profile_pic.hash, banner_img.hash FROM user`,
+		compileQuery[User](`SELECT $columns FROM user`),
+	)
+	assert.Equal(t,
+		`SELECT user.id, user.name, user.nickname, user_profile_pic.hash, user_banner_img.hash FROM user`,
+		compileQuery[User](`SELECT $columns{user} FROM user`),
+	)
 }

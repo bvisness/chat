@@ -27,16 +27,13 @@ var NotFound = errors.New("not found")
 // Any SQL query may be performed, including INSERT and UPDATE - as long as it
 // returns a result set, you can use this. If the query does not return a
 // result set, or you simply do not care about the result set, call Exec
-// directly on your pgx connection.
-//
-// This function always returns pointers to the values. This is convenient for
-// structs, but for other types, you may wish to use QueryScalar.
+// directly.
 func Query[T any](
 	ctx context.Context,
 	conn *sql.DB,
 	query string,
 	args ...any,
-) ([]*T, error) {
+) ([]T, error) {
 	it, err := QueryIterator[T](ctx, conn, query, args...)
 	if err != nil {
 		return nil, err
@@ -52,72 +49,17 @@ func QueryOne[T any](
 	conn *sql.DB,
 	query string,
 	args ...any,
-) (*T, error) {
-	it, err := QueryIterator[T](ctx, conn, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer it.Close()
-
-	result, hasRow := it.Next()
-	if !hasRow {
-		if readErr := it.Err(); readErr != nil {
-			return nil, readErr
-		} else {
-			return nil, NotFound
-		}
-	}
-
-	return result, nil
-}
-
-// Identical to Query, but returns concrete values instead of pointers. More
-// convenient for primitive types.
-func QueryScalar[T any](
-	ctx context.Context,
-	conn *sql.DB,
-	query string,
-	args ...any,
-) ([]T, error) {
-	it, err := QueryIterator[T](ctx, conn, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer it.Close()
-
-	var result []T
-	for {
-		val, hasRow := it.Next()
-		if !hasRow {
-			break
-		}
-		result = append(result, *val)
-	}
-
-	if iterErr := it.Err(); iterErr != nil {
-		return nil, iterErr
-	}
-	return result, nil
-}
-
-// Identical to QueryScalar, but returns only the first result value. If there
-// are no rows in the result set, returns NotFound.
-func QueryOneScalar[T any](
-	ctx context.Context,
-	conn *sql.DB,
-	query string,
-	args ...any,
 ) (T, error) {
+	var zero, result T
+
 	it, err := QueryIterator[T](ctx, conn, query, args...)
 	if err != nil {
-		var zero T
 		return zero, err
 	}
 	defer it.Close()
 
-	result, hasRow := it.Next()
+	hasRow := it.Next(&result)
 	if !hasRow {
-		var zero T
 		if readErr := it.Err(); readErr != nil {
 			return zero, readErr
 		} else {
@@ -125,7 +67,7 @@ func QueryOneScalar[T any](
 		}
 	}
 
-	return *result, nil
+	return result, nil
 }
 
 // Identical to Query, but returns the ResultIterator instead of automatically
@@ -173,7 +115,7 @@ func compileQuery[T any](query string) string {
 			prefix = []string{prefixText}
 		}
 
-		columnNames := getColumnNames[T](prefix)
+		columnNames := getColumnNames(reflect.TypeFor[T](), prefix)
 
 		columns := make([]string, 0, len(columnNames))
 		for _, strSlice := range columnNames {
@@ -197,16 +139,28 @@ func compileQuery[T any](query string) string {
 // to be splatted down to a single string for the final query.
 type columnName []string
 
-func getColumnNames[T any](prefix []string) []columnName {
-	var res []columnName
-
-	tStruct := reflect.TypeFor[T]()
+func getColumnNames(tStruct reflect.Type, prefix columnName) []columnName {
 	utils.Assert(tStruct.Kind() == reflect.Struct)
 
-	// for f := range dbFields(tStruct) {
-	// 	if f.
-	// }
+	var res []columnName
+	for f := range dbFields(tStruct) {
+		var name columnName = prefix
+		for i := 1; i <= len(f.Index); i++ {
+			fieldInChain := tStruct.FieldByIndex(f.Index[:i])
+			dbTag := fieldInChain.Tag.Get("db")
+			if dbTag != "" {
+				name = append(name, dbTag)
+			}
+		}
 
+		if f.Type.Kind() == reflect.Struct {
+			res = append(res, getColumnNames(f.Type, name)...)
+		} else if f.Type.Kind() == reflect.Pointer && f.Type.Elem().Kind() == reflect.Struct {
+			res = append(res, getColumnNames(f.Type.Elem(), name)...)
+		} else {
+			res = append(res, name)
+		}
+	}
 	return res
 }
 
@@ -218,29 +172,25 @@ type Iterator[T any] struct {
 	scanErr error
 }
 
-func (it *Iterator[T]) Next() (*T, bool) {
-	// TODO(ben): What happens if this panics? Does it leak resources? Do we need
-	// to put a recover() here and close the rows?
-
+func (it *Iterator[T]) Next(out *T) bool {
 	if it.ctx.Err() != nil {
 		it.Close()
-		return nil, false
+		return false
 	}
 
 	hasNext := it.rows.Next()
 	if !hasNext {
-		return nil, false
+		return false
 	}
 
-	result := new(T)
-	scanArgs := generateScanArgs(result)
+	scanArgs := generateScanArgs(out)
 	if err := it.rows.Scan(scanArgs...); err != nil {
 		it.scanErr = err
-		return nil, false
+		return false
 	}
 	AssertAllComplete(scanArgs)
 
-	return result, true
+	return true
 }
 
 func (it *Iterator[T]) Err() error {
@@ -256,11 +206,12 @@ func (it *Iterator[T]) Close() {
 }
 
 // Pulls all the remaining values into a slice, and closes the iterator.
-func (it *Iterator[T]) ToSlice() ([]*T, error) {
+func (it *Iterator[T]) ToSlice() ([]T, error) {
 	defer it.Close()
-	var result []*T
+	var result []T
 	for {
-		row, ok := it.Next()
+		var row T
+		ok := it.Next(&row)
 		if !ok {
 			break
 		}
@@ -537,7 +488,7 @@ type NullStruct struct {
 func NewNullStruct(ptrToNullableStruct any) (*NullStruct, int) {
 	vPtrToNullableStruct := reflect.ValueOf(ptrToNullableStruct)
 	tStruct := vPtrToNullableStruct.Type().Elem().Elem()
-	expectedScanCount := countScans(tStruct)
+	expectedScanCount := countStructScans(tStruct)
 	return &NullStruct{
 		vPtrToNullableStruct: vPtrToNullableStruct,
 		tStruct:              tStruct,
@@ -545,7 +496,8 @@ func NewNullStruct(ptrToNullableStruct any) (*NullStruct, int) {
 	}, expectedScanCount
 }
 
-func countScans(tStruct reflect.Type) int {
+// Counts how many times a struct is expected to be scanned.
+func countStructScans(tStruct reflect.Type) int {
 	var res int
 	for field := range dbFields(tStruct) {
 		tField := field.Type
@@ -558,9 +510,9 @@ func countScans(tStruct reflect.Type) int {
 		} else if tField.Kind() == reflect.Pointer && typeIsScannablePrimitive(tField.Elem()) {
 			res += 1
 		} else if tField.Kind() == reflect.Struct {
-			res += countScans(tField)
+			res += countStructScans(tField)
 		} else if tField.Kind() == reflect.Pointer && tField.Elem().Kind() == reflect.Struct {
-			res += countScans(tField.Elem())
+			res += countStructScans(tField.Elem())
 		} else {
 			panic(fmt.Errorf("type %s is not compatible with sql.Rows.Scan", tField))
 		}
@@ -646,16 +598,6 @@ func dbFields(tStruct reflect.Type) iter.Seq[reflect.StructField] {
 			}
 
 			if columnName := field.Tag.Get("db"); columnName != "" {
-				// Validate that anything with a tag has parent fields with a tag
-				if len(field.Index) > 1 {
-					for i := 0; i < len(field.Index)-1; i++ {
-						parentField := tStruct.FieldByIndex(field.Index[:i])
-						if parentField.Tag.Get("db") == "" {
-							panic(fmt.Errorf("for field %s of type %s: parent embedding type %s has no db tag", field.Name, tStruct, parentField.Type))
-						}
-					}
-				}
-
 				if !yield(field) {
 					return
 				}
