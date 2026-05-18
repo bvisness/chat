@@ -94,76 +94,6 @@ func QueryIterator[T any](
 	return it, nil
 }
 
-var reColumnsPlaceholder = regexp.MustCompile(`\$columns({(.*?)})?`)
-
-func compileQuery[T any](query string) string {
-	columnsMatch := reColumnsPlaceholder.FindStringSubmatch(query)
-	hasColumnsPlaceholder := columnsMatch != nil
-
-	if hasColumnsPlaceholder {
-		// The presence of the $columns placeholder means that the destination type
-		// must be a struct, and we will plonk that struct's fields into the query.
-
-		tDest := reflect.TypeFor[T]()
-		if tDest.Kind() != reflect.Struct {
-			panic("$columns can only be used when querying into a struct")
-		}
-
-		var prefix []string
-		prefixText := columnsMatch[2]
-		if prefixText != "" {
-			prefix = []string{prefixText}
-		}
-
-		columnNames := getColumnNames(reflect.TypeFor[T](), prefix)
-
-		columns := make([]string, 0, len(columnNames))
-		for _, strSlice := range columnNames {
-			tableName := strings.Join(strSlice[0:len(strSlice)-1], "_")
-			fullName := strSlice[len(strSlice)-1]
-			if tableName != "" {
-				fullName = tableName + "." + fullName
-			}
-			columns = append(columns, fullName)
-		}
-
-		columnNamesString := strings.Join(columns, ", ")
-		query = reColumnsPlaceholder.ReplaceAllString(query, columnNamesString)
-	}
-
-	return query
-}
-
-// Column names are generated from `db` tags on struct fields. Nested structs
-// will cause a given column name to have more than one entry, which will need
-// to be splatted down to a single string for the final query.
-type columnName []string
-
-func getColumnNames(tStruct reflect.Type, prefix columnName) []columnName {
-	utils.Assert(tStruct.Kind() == reflect.Struct)
-
-	var res []columnName
-	for f := range dbFields(tStruct) {
-		var name columnName = prefix
-		for i := 1; i <= len(f.Index); i++ {
-			fieldInChain := tStruct.FieldByIndex(f.Index[:i])
-			dbTag := fieldInChain.Tag.Get("db")
-			if dbTag != "" {
-				name = append(name, dbTag)
-			}
-		}
-
-		if f.Type.Kind() == reflect.Struct {
-			res = append(res, getColumnNames(f.Type, name)...)
-		} else if f.Type.Kind() == reflect.Pointer && f.Type.Elem().Kind() == reflect.Struct {
-			res = append(res, getColumnNames(f.Type.Elem(), name)...)
-		} else {
-			res = append(res, name)
-		}
-	}
-	return res
-}
-
 type Iterator[T any] struct {
 	rows *sql.Rows
 
@@ -221,6 +151,95 @@ func (it *Iterator[T]) ToSlice() ([]T, error) {
 		return nil, err
 	}
 	return result, nil
+}
+
+var reColumnsPlaceholder = regexp.MustCompile(`\$columns({(.*?)})?`)
+
+func compileQuery[T any](query string) string {
+	columnsMatch := reColumnsPlaceholder.FindStringSubmatch(query)
+	hasColumnsPlaceholder := columnsMatch != nil
+
+	if hasColumnsPlaceholder {
+		// The presence of the $columns placeholder means that the destination type
+		// must be a struct, and we will plonk that struct's fields into the query.
+
+		tDest := reflect.TypeFor[T]()
+		if tDest.Kind() != reflect.Struct {
+			panic("$columns can only be used when querying into a struct")
+		}
+
+		var prefix []string
+		prefixText := columnsMatch[2]
+		if prefixText != "" {
+			prefix = []string{prefixText}
+		}
+
+		columnNames := getColumnNames(reflect.TypeFor[T](), prefix)
+
+		columns := make([]string, 0, len(columnNames))
+		for _, strSlice := range columnNames {
+			tableName := strings.Join(strSlice[0:len(strSlice)-1], "_")
+			fullName := strSlice[len(strSlice)-1]
+			if tableName != "" {
+				fullName = tableName + "." + fullName
+			}
+			columns = append(columns, fullName)
+		}
+
+		columnNamesString := strings.Join(columns, ", ")
+		query = reColumnsPlaceholder.ReplaceAllString(query, columnNamesString)
+	}
+
+	return query
+}
+
+// Column names are generated from `db` tags on struct fields. Nested structs
+// will cause a given column name to have more than one entry, which will need
+// to be splatted down to a single string for the final query.
+type columnName []string
+
+// Given a struct type, returns an iterator over all exported struct fields
+// with a `db` tag. Fields from embedded structs will be included.
+func dbFields(tStruct reflect.Type) iter.Seq[reflect.StructField] {
+	utils.Assert(tStruct.Kind() == reflect.Struct, "DBFields requires a struct type")
+	return func(yield func(reflect.StructField) bool) {
+		for _, field := range reflect.VisibleFields(tStruct) {
+			if !field.IsExported() || field.Anonymous {
+				continue
+			}
+
+			if columnName := field.Tag.Get("db"); columnName != "" {
+				if !yield(field) {
+					return
+				}
+			}
+		}
+	}
+}
+
+func getColumnNames(tStruct reflect.Type, prefix columnName) []columnName {
+	utils.Assert(tStruct.Kind() == reflect.Struct)
+
+	var res []columnName
+	for f := range dbFields(tStruct) {
+		var name columnName = prefix
+		for i := 1; i <= len(f.Index); i++ {
+			fieldInChain := tStruct.FieldByIndex(f.Index[:i])
+			dbTag := fieldInChain.Tag.Get("db")
+			if dbTag != "" {
+				name = append(name, dbTag)
+			}
+		}
+
+		if f.Type.Kind() == reflect.Struct {
+			res = append(res, getColumnNames(f.Type, name)...)
+		} else if f.Type.Kind() == reflect.Pointer && f.Type.Elem().Kind() == reflect.Struct {
+			res = append(res, getColumnNames(f.Type.Elem(), name)...)
+		} else {
+			res = append(res, name)
+		}
+	}
+	return res
 }
 
 // Given a pointer to a struct, generates a slice of pointers to
@@ -584,24 +603,5 @@ func CheckAllComplete(scanArgs []any) error {
 func AssertAllComplete(scanArgs []any) {
 	if err := CheckAllComplete(scanArgs); err != nil {
 		panic(err)
-	}
-}
-
-// Given a struct type, returns an iterator over all exported struct fields
-// with a `db` tag.
-func dbFields(tStruct reflect.Type) iter.Seq[reflect.StructField] {
-	utils.Assert(tStruct.Kind() == reflect.Struct, "DBFields requires a struct type")
-	return func(yield func(reflect.StructField) bool) {
-		for _, field := range reflect.VisibleFields(tStruct) {
-			if !field.IsExported() || field.Anonymous {
-				continue
-			}
-
-			if columnName := field.Tag.Get("db"); columnName != "" {
-				if !yield(field) {
-					return
-				}
-			}
-		}
 	}
 }
