@@ -136,12 +136,8 @@ func QueryIterator[T any](
 	query string,
 	args ...any,
 ) (*Iterator[T], error) {
-	var destExample T
-	destType := reflect.TypeOf(destExample)
-
-	compiled := compileQuery(query, destType)
-
-	rows, err := conn.QueryContext(ctx, compiled.query, args...)
+	compiled := compileQuery[T](query)
+	rows, err := conn.QueryContext(ctx, compiled, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -156,15 +152,9 @@ func QueryIterator[T any](
 	return it, nil
 }
 
-type compiledQuery struct {
-	query      string
-	destType   reflect.Type
-	fieldPaths []fieldPath
-}
-
 var reColumnsPlaceholder = regexp.MustCompile(`\$columns({(.*?)})?`)
 
-func compileQuery(query string, destType reflect.Type) compiledQuery {
+func compileQuery[T any](query string) string {
 	columnsMatch := reColumnsPlaceholder.FindStringSubmatch(query)
 	hasColumnsPlaceholder := columnsMatch != nil
 
@@ -172,7 +162,8 @@ func compileQuery(query string, destType reflect.Type) compiledQuery {
 		// The presence of the $columns placeholder means that the destination type
 		// must be a struct, and we will plonk that struct's fields into the query.
 
-		if destType.Kind() != reflect.Struct {
+		tDest := reflect.TypeFor[T]()
+		if tDest.Kind() != reflect.Struct {
 			panic("$columns can only be used when querying into a struct")
 		}
 
@@ -182,7 +173,7 @@ func compileQuery(query string, destType reflect.Type) compiledQuery {
 			prefix = []string{prefixText}
 		}
 
-		columnNames, fieldPaths := getColumnNamesAndPaths(destType, nil, prefix)
+		columnNames := getColumnNames[T](prefix)
 
 		columns := make([]string, 0, len(columnNames))
 		for _, strSlice := range columnNames {
@@ -196,28 +187,27 @@ func compileQuery(query string, destType reflect.Type) compiledQuery {
 
 		columnNamesString := strings.Join(columns, ", ")
 		query = reColumnsPlaceholder.ReplaceAllString(query, columnNamesString)
-
-		return compiledQuery{
-			query:      query,
-			destType:   destType,
-			fieldPaths: fieldPaths,
-		}
-	} else {
-		return compiledQuery{
-			query:    query,
-			destType: destType,
-		}
 	}
+
+	return query
 }
 
+// Column names are generated from `db` tags on struct fields. Nested structs
+// will cause a given column name to have more than one entry, which will need
+// to be splatted down to a single string for the final query.
 type columnName []string
 
-// A path to a particular field in query's destination type. Each index in the slice
-// corresponds to a field index for use with Field on a reflect.Type or reflect.Value.
-type fieldPath []int
+func getColumnNames[T any](prefix []string) []columnName {
+	var res []columnName
 
-func getColumnNamesAndPaths(destType reflect.Type, pathSoFar []int, prefix []string) (names []columnName, paths []fieldPath) {
-	panic("TODO: We need at least some of this for generating the actual query text, and it needs to correspond to generateScanArgs")
+	tStruct := reflect.TypeFor[T]()
+	utils.Assert(tStruct.Kind() == reflect.Struct)
+
+	// for f := range dbFields(tStruct) {
+	// 	if f.
+	// }
+
+	return res
 }
 
 type Iterator[T any] struct {
@@ -243,10 +233,12 @@ func (it *Iterator[T]) Next() (*T, bool) {
 	}
 
 	result := new(T)
-	if err := it.rows.Scan(generateScanArgs(result)...); err != nil {
+	scanArgs := generateScanArgs(result)
+	if err := it.rows.Scan(scanArgs...); err != nil {
 		it.scanErr = err
 		return nil, false
 	}
+	AssertAllComplete(scanArgs)
 
 	return result, true
 }
@@ -298,7 +290,7 @@ func appendScanArgs(outStruct any, args *[]any) {
 	vStruct := reflect.ValueOf(outStruct).Elem()
 	tStruct := vStruct.Type()
 
-	for field := range DBFields(tStruct) {
+	for field := range dbFields(tStruct) {
 		vField := vStruct.FieldByIndex(field.Index)
 		tField := field.Type
 
@@ -555,7 +547,7 @@ func NewNullStruct(ptrToNullableStruct any) (*NullStruct, int) {
 
 func countScans(tStruct reflect.Type) int {
 	var res int
-	for field := range DBFields(tStruct) {
+	for field := range dbFields(tStruct) {
 		tField := field.Type
 
 		// The logic here mirrors [appendScanArgs] and should be kept in sync.
@@ -645,15 +637,25 @@ func AssertAllComplete(scanArgs []any) {
 
 // Given a struct type, returns an iterator over all exported struct fields
 // with a `db` tag.
-func DBFields(tStruct reflect.Type) iter.Seq[reflect.StructField] {
+func dbFields(tStruct reflect.Type) iter.Seq[reflect.StructField] {
 	utils.Assert(tStruct.Kind() == reflect.Struct, "DBFields requires a struct type")
 	return func(yield func(reflect.StructField) bool) {
 		for _, field := range reflect.VisibleFields(tStruct) {
-			if !field.IsExported() {
+			if !field.IsExported() || field.Anonymous {
 				continue
 			}
 
 			if columnName := field.Tag.Get("db"); columnName != "" {
+				// Validate that anything with a tag has parent fields with a tag
+				if len(field.Index) > 1 {
+					for i := 0; i < len(field.Index)-1; i++ {
+						parentField := tStruct.FieldByIndex(field.Index[:i])
+						if parentField.Tag.Get("db") == "" {
+							panic(fmt.Errorf("for field %s of type %s: parent embedding type %s has no db tag", field.Name, tStruct, parentField.Type))
+						}
+					}
+				}
+
 				if !yield(field) {
 					return
 				}
