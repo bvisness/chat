@@ -32,17 +32,18 @@ var migrations = []db.Migration{
 var migrator = db.Migrator{
 	ReadCurrentID: func(ctx context.Context, conn *sql.DB) (int, error) {
 		_, err := conn.ExecContext(ctx, `
-			CREATE TABLE IF NOT EXISTS _migration AS SELECT -1 AS current_id
+			CREATE TABLE IF NOT EXISTS _migration AS
+				SELECT -1 AS current_id, '' AS current_name
 		`)
 		if err != nil {
 			return 0, fmt.Errorf("failed to create migration table: %w", err)
 		}
 		return db.QueryOne[int](ctx, conn, `SELECT current_id FROM _migration`)
 	},
-	WriteCurrentID: func(ctx context.Context, tx *sql.Tx, newID int) error {
+	WriteCurrent: func(ctx context.Context, tx *sql.Tx, newID int, newName string) error {
 		_, err := tx.ExecContext(ctx, `
-			UPDATE _migration SET current_id = ?
-		`, newID)
+			UPDATE _migration SET current_id = ?, current_name = ?
+		`, newID, newName)
 		return err
 	},
 }
