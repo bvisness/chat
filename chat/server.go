@@ -2,6 +2,7 @@ package chat
 
 import (
 	"context"
+	"database/sql"
 	"io"
 	"net/http"
 	"os"
@@ -11,7 +12,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bvisness/chat/db"
 	"github.com/bvisness/chat/glog"
+	"github.com/bvisness/chat/utils"
 )
 
 const serverShutdownTimeout = 10 * time.Second
@@ -20,6 +23,10 @@ var log = glog.Logger{}
 
 func Run() {
 	var wg sync.WaitGroup
+
+	conn := utils.Must1(sql.Open("sqlite3", "file:chat.db"))
+	defer conn.Close()
+	utils.Must(migrator.Migrate(context.Background(), conn, migrations, db.MigrateAll))
 
 	wg.Add(1)
 	server := http.Server{

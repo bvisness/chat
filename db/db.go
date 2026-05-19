@@ -247,17 +247,25 @@ func getColumnNames(tStruct reflect.Type, prefix columnName) []columnName {
 // `db` tags on each field.
 //
 // The result of this function can be passed to Rows.Scan.
-func generateScanArgs(outStruct any) []any {
+func generateScanArgs(out any) []any {
 	var res []any
-	appendScanArgs(outStruct, &res)
+	appendScanArgs(out, &res)
 	return res
 }
 
-func appendScanArgs(outStruct any, args *[]any) {
-	utils.Assert(reflect.TypeOf(outStruct).Kind() == reflect.Pointer, "generateScanArgs requires a pointer to a struct")
-	utils.Assert(reflect.TypeOf(outStruct).Elem().Kind() == reflect.Struct, "generateScanArgs requires a pointer to a struct")
+func appendScanArgs(out any, args *[]any) {
+	tOut := reflect.TypeOf(out)
+	utils.Assert(tOut.Kind() == reflect.Pointer, "generateScanArgs requires a pointer")
 
-	vStruct := reflect.ValueOf(outStruct).Elem()
+	// If we get something directly that implements Scanner, or we just don't get
+	// a struct, just pass it straight along to Scan and see what happens.
+	// (Mostly this is here for primitive values.)
+	if tOut.Implements(reflect.TypeFor[sql.Scanner]()) || tOut.Elem().Kind() != reflect.Struct {
+		*args = append(*args, out)
+		return
+	}
+
+	vStruct := reflect.ValueOf(out).Elem()
 	tStruct := vStruct.Type()
 
 	for field := range dbFields(tStruct) {
