@@ -2,8 +2,6 @@ package chat
 
 import (
 	"fmt"
-
-	"github.com/bvisness/chat/utils"
 )
 
 // ============================================================================
@@ -14,18 +12,20 @@ import (
 /*
 NOTE(ben): Events vs. Records
 
-Events are the data actually sent as WebSocket messages. They are "ephemeral", in the sense that
-they are understood to be unreliable against application-level errors, such as the server crashing
-while handling them. Of course, since they are sent over TCP, they are still reliably transmitted
-as long as the connection remains alive, and will block other messages from being handled.
+Events are the data actually sent as WebSocket messages. They are "ephemeral",
+in the sense that they are understood to be unreliable against application-
+level errors, such as the server crashing while handling them. Of course, since
+they are sent over TCP, they are still reliably transmitted as long as the
+connection remains alive, and will block other messages from being handled.
 
-Records are data that make up the core, server-authoritative, super-reliable stream of chat data.
-For each channel there is a reliable stream of records that is synchronized to all clients. Clients
-can send new records to the server; they will be added to the core record stream and retransmitted
-by the server. (TODO: Correlate these messages using a hash or something.)
+Records are data that make up the core, server-authoritative, super-reliable
+stream of chat data. For each channel there is a reliable stream of records
+that is synchronized to all clients. Clients can send new records to the
+server; they will be added to the core record stream and retransmitted by the
+server. (TODO: Correlate these messages using a hash or something.)
 
-Both of these are dancing around the name "message", which we keep reserved for chat messages to
-reduce cognitive burden.
+Both of these are dancing around the name "message", which we keep reserved for
+chat messages to reduce cognitive burden.
 */
 
 type EventType byte
@@ -48,16 +48,26 @@ const (
 )
 
 func CreateSYNEvent(buf []byte) []byte {
-	w := eventWriter{buf: buf}
-	utils.Must(w.WriteByte(byte(ETSYN), "message type"))
-	return w.Bytes()
+	w := Writer{buf: buf}
+	w.Object()
+	w.FieldByte("type", byte(ETSYN))
+	w.End()
+	if w.Err() != nil {
+		panic(w.Err())
+	}
+	return w.Written()
 }
 
 func CreateErrorEvent(buf []byte, msg string, args ...any) []byte {
-	w := eventWriter{buf: buf}
-	utils.Must(w.WriteByte(byte(ETError), "message type"))
-	utils.Must(w.WriteString(fmt.Sprintf(msg, args...), "error message"))
-	return w.Bytes()
+	w := Writer{buf: buf}
+	w.Object()
+	w.FieldByte("type", byte(ETError))
+	w.FieldStr("message", fmt.Sprintf(msg, args...))
+	w.End()
+	if w.Err() != nil {
+		panic(w.Err())
+	}
+	return w.Written()
 }
 
 // TODO(ben): Whatever the protocol ends up being, I do feel it would be wise to design a binary

@@ -1,6 +1,8 @@
 package chat
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bvisness/chat/db"
 	"github.com/bvisness/chat/glog"
 	"github.com/bvisness/chat/utils"
 	"github.com/gorilla/websocket"
@@ -41,6 +44,7 @@ const eventStreamShutdownTimeout = 8 * time.Second
 type EventStreamSession struct {
 	state           EventStreamState
 	conn            *websocket.Conn
+	db              *sql.DB
 	clientNeedsSync utils.Waiter
 	clientACK       int64
 
@@ -114,8 +118,8 @@ func hEventStream(c *Request) (res Response) {
 
 	s.clientNeedsSync = utils.NewWaiter()
 	defer close(s.clientNeedsSync)
-	newEventNotifications.Subscribe(s.clientNeedsSync)
-	defer newEventNotifications.Unsubscribe(s.clientNeedsSync)
+	newRecordNotifications.Subscribe(s.clientNeedsSync)
+	defer newRecordNotifications.Unsubscribe(s.clientNeedsSync)
 	s.clientACK = -1
 
 	defer log.Recover("Event stream crashed")
@@ -170,11 +174,23 @@ func hEventStream(c *Request) (res Response) {
 				// NOTE(ben): Don't write new messages if we're closing.
 				break thisiter
 			}
-			EventLog := EventLog // NOTE(ben): Get a stable view of the log
-			if len(EventLog) == 0 {
+
+			type row struct {
+				SN   int64  `db:"id"`
+				Data []byte `db:"data"`
+			}
+			rows, err := db.Query[row](c.Ctx, s.db, `
+				SELECT $columns FROM records
+				WHERE id > $?
+			`, s.clientACK)
+			if err != nil {
+				s.unexpectedErr = fmt.Errorf("querying records: %w", err)
+				return
+			}
+			if len(rows) == 0 {
 				break thisiter
 			}
-			latestSN := EventLog[len(EventLog)-1].SN
+			latestSN := rows[len(rows)-1].SN
 			if latestSN < s.clientACK {
 				// NOTE(ben): Impossible ACK from client, indicating misbehavior
 				s.sendErrorToClient("you ACKed %d but %d is the most recent event", s.clientACK, latestSN)
@@ -185,15 +201,11 @@ func hEventStream(c *Request) (res Response) {
 			}
 
 			// HACK(ben): Abusing the fact that, for now, SN == index in Events
-			for _, event := range EventLog[s.clientACK+1:] {
-				w := eventWriter{buf: s.buf[:]}
-				// NOTE(ben): This should not fail because the buffer should, you know, exist.
-				utils.Must(w.WriteByte(byte(ETRecord), "message type"))
-				if err := event.Serialize(&w); err != nil {
-					s.unexpectedErr = fmt.Errorf("serializing event for client: %w", err)
-					return
-				}
-				if err := s.conn.WriteMessage(websocket.BinaryMessage, w.Bytes()); err != nil {
+			for _, row := range rows {
+				// TODO: Re-serialize the data here so that clients don't have to keep
+				// up with the full history of versions
+
+				if err := s.conn.WriteMessage(websocket.BinaryMessage, row.Data); err != nil {
 					s.unexpectedErr = fmt.Errorf("sending event to client: %w", err)
 					return
 				}
@@ -260,7 +272,7 @@ func hEventStream(c *Request) (res Response) {
 					return false, nil
 				}
 
-				if err := s.handleClientEvent(event); err != nil {
+				if err := s.handleClientEvent(c.Ctx, event); err != nil {
 					return true, fmt.Errorf("in handleClientMessage: %w", err)
 				}
 
@@ -279,8 +291,8 @@ func hEventStream(c *Request) (res Response) {
 
 // Handles a single WebSocket message from the client. The error return is ONLY for unexpected
 // errors that should terminate the connection.
-func (s *EventStreamSession) handleClientEvent(eventData []byte) error {
-	p := &eventParser{data: eventData}
+func (s *EventStreamSession) handleClientEvent(ctx context.Context, eventData []byte) error {
+	p := &parser{data: eventData}
 
 	eventType, err := p.ReadByte("event type")
 	if err != nil {
@@ -288,7 +300,7 @@ func (s *EventStreamSession) handleClientEvent(eventData []byte) error {
 	}
 	switch EventType(eventType) {
 	case ETRecord:
-		s.handleClientRecord(p)
+		s.handleClientRecord(ctx, p)
 
 	case ETACK:
 		// Client acknowledging receipt of server events.
@@ -306,24 +318,37 @@ func (s *EventStreamSession) handleClientEvent(eventData []byte) error {
 	return nil
 }
 
-func (s *EventStreamSession) handleClientRecord(p *eventParser) error {
+func (s *EventStreamSession) handleClientRecord(ctx context.Context, p *parser) error {
 	recordType, err := p.ReadByte("record type")
 	if err != nil {
 		return s.sendErrorToClient("missing event type")
 	}
+
+	var r Record
 	switch RecordType(recordType) {
 	case RTMessage:
 		text, err := p.ReadUTF8String("message text")
 		if err != nil {
 			return s.sendErrorToClient("%s", err)
 		}
-		newEvents <- Event{
+		r = Record{
 			Type:        RTMessage,
 			MessageText: text,
 		}
 	default:
-		return s.sendErrorToClient("unknown event type %v", recordType)
+		return s.sendErrorToClient("unknown record type %v", recordType)
 	}
+
+	serialized, err := Serialize(r, s.buf[:])
+	if err != nil {
+		return fmt.Errorf("in handleClientRecord: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO records (data) VALUES (?)`, serialized)
+	if err != nil {
+		return fmt.Errorf("in handleClientRecord: %w", err)
+	}
+
+	// TODO: Wake all sessions because a new message has arrived?
 
 	return nil
 }

@@ -4,18 +4,17 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"math"
 	"unicode/utf8"
 
 	"github.com/bvisness/chat/utils"
 )
 
-type eventParser struct {
+type parser struct {
 	data []byte
 	cur  int
 }
 
-func (p *eventParser) ReadByte(thing string) (byte, error) {
+func (p *parser) ReadByte(thing string) (byte, error) {
 	res, err := p.ReadBytes(1, thing)
 	if err != nil {
 		return 0, err
@@ -23,7 +22,7 @@ func (p *eventParser) ReadByte(thing string) (byte, error) {
 	return res[0], nil
 }
 
-func (p *eventParser) ReadBytes(n int, thing string) ([]byte, error) {
+func (p *parser) ReadBytes(n int, thing string) ([]byte, error) {
 	if len(p.data[p.cur:]) < n {
 		return nil, fmt.Errorf("parsing %s: %w", thing, io.ErrUnexpectedEOF)
 	}
@@ -32,7 +31,7 @@ func (p *eventParser) ReadBytes(n int, thing string) ([]byte, error) {
 	return res, nil
 }
 
-func (p *eventParser) ReadU32(thing string) (uint32, error) {
+func (p *parser) ReadU32(thing string) (uint32, error) {
 	b, err := p.ReadBytes(4, thing)
 	if err != nil {
 		return 0, err
@@ -40,7 +39,7 @@ func (p *eventParser) ReadU32(thing string) (uint32, error) {
 	return binary.LittleEndian.Uint32(b), nil
 }
 
-func (p *eventParser) ReadS64(thing string) (int64, error) {
+func (p *parser) ReadS64(thing string) (int64, error) {
 	b, err := p.ReadBytes(8, thing)
 	if err != nil {
 		return 0, err
@@ -48,7 +47,7 @@ func (p *eventParser) ReadS64(thing string) (int64, error) {
 	return int64(binary.LittleEndian.Uint64(b)), nil
 }
 
-func (p *eventParser) ReadUTF8String(thing string) (string, error) {
+func (p *parser) ReadUTF8String(thing string) (string, error) {
 	n, err := p.ReadU32(thing)
 	if err != nil {
 		return "", err
@@ -63,66 +62,143 @@ func (p *eventParser) ReadUTF8String(thing string) (string, error) {
 	return string(b), nil
 }
 
-type eventWriter struct {
+type Writer struct {
 	buf []byte
 	cur int
+	err error
 }
 
-func (w *eventWriter) Check(nBytes int, thing string) error {
-	if len(w.buf[w.cur:]) < nBytes {
-		return fmt.Errorf("writing %s: %w", thing, io.ErrUnexpectedEOF)
-	}
-	return nil
+type Writable interface {
+	Write(w *Writer)
 }
 
-func (w *eventWriter) Bytes() []byte {
+type SType uint8
+
+const (
+	STError SType = iota
+	STEnd
+	STObject
+	STArray
+	STS8
+	STU8
+	STS32
+	STU32
+	STS64
+	STU64
+	STF32
+	STF64
+	STBool
+	STString
+)
+
+func (w *Writer) Written() []byte {
 	return w.buf[:w.cur]
 }
 
-func (w *eventWriter) WriteByte(v byte, thing string) error {
-	if err := w.Check(1, thing); err != nil {
-		return err
+func (w *Writer) Check(nBytes int) {
+	if w.err != nil {
+		return
 	}
-	w.buf[w.cur] = v
-	w.cur += 1
-	return nil
+	if len(w.buf[w.cur:]) < nBytes {
+		w.err = io.ErrUnexpectedEOF
+	}
 }
 
-func (w *eventWriter) WriteBytes(v []byte, thing string) error {
-	if err := w.Check(len(v), thing); err != nil {
-		return err
+func (w *Writer) Err() error {
+	return w.err
+}
+
+func (w *Writer) RawByte(b byte) {
+	w.Check(1)
+	if w.Err() != nil {
+		return
 	}
+
+	w.buf[w.cur] = b
+	w.cur += 1
+}
+
+func (w *Writer) RawBytes(v []byte) {
+	w.Check(len(v))
+	if w.Err() != nil {
+		return
+	}
+
 	n := copy(w.buf[w.cur:], v)
 	utils.Assert(n == len(v))
 	w.cur += n
-	return nil
 }
 
-func (w *eventWriter) WriteU32(v uint32, thing string) error {
-	if err := w.Check(4, thing); err != nil {
-		return err
+func (w *Writer) Byte(b byte) {
+	w.Check(1 + 1)
+	if w.Err() != nil {
+		return
 	}
-	binary.LittleEndian.PutUint32(w.buf[w.cur:], v)
-	w.cur += 4
-	return nil
+
+	w.RawByte(byte(STU8))
+	w.buf[w.cur] = b
+	w.cur += 1
 }
 
-func (w *eventWriter) WriteS64(v int64, thing string) error {
-	if err := w.Check(8, thing); err != nil {
-		return err
+func (w *Writer) U64(v uint64) {
+	w.Check(1 + 8)
+	if w.Err() != nil {
+		return
 	}
+
+	w.RawByte(byte(STU64))
+	binary.LittleEndian.PutUint64(w.buf[w.cur:], v)
+	w.cur += 8
+}
+
+func (w *Writer) S64(v int64) {
+	w.Check(1 + 8)
+	if w.Err() != nil {
+		return
+	}
+
+	w.RawByte(byte(STS64))
 	binary.LittleEndian.PutUint64(w.buf[w.cur:], uint64(v))
 	w.cur += 8
-	return nil
 }
 
-func (w *eventWriter) WriteString(v string, thing string) error {
-	utils.Assert(len(v) < math.MaxUint32)
-	if err := w.WriteU32(uint32(len(v)), thing+" length"); err != nil {
-		return err
+func (w *Writer) FieldByte(name string, b byte) {
+	w.Str(name)
+	w.Byte(b)
+}
+
+func (w *Writer) FieldS64(name string, v int64) {
+	w.Str(name)
+	w.S64(v)
+}
+
+func (w *Writer) FieldStr(name string, s string) {
+	w.Str(name)
+	w.Str(s)
+}
+
+func (w *Writer) Object() {
+	w.RawByte(byte(STObject))
+}
+
+func (w *Writer) End() {
+	w.RawByte(byte(STEnd))
+}
+
+func (w *Writer) Str(s string) {
+	w.S64(int64(len(s)))
+	w.RawBytes([]byte(s))
+}
+
+func (w *Writer) Writable(v Writable) {
+	v.Write(w)
+}
+
+func Serialize(v Writable, buf []byte) ([]byte, error) {
+	w := Writer{buf: buf}
+	v.Write(&w)
+	if w.Err() != nil {
+		return nil, w.Err()
 	}
-	if err := w.WriteBytes([]byte(v), thing); err != nil {
-		return err
-	}
-	return nil
+	return w.buf[:w.cur], nil
 }

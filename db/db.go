@@ -42,6 +42,22 @@ func Query[T any](
 	}
 }
 
+// Identical to Query, but returns a sequence of the results instead of a
+// slice. Any error returned by QuerySeq is an error that occurred at query
+// time; any error yielded by the sequence occurred during iteration time.
+func QuerySeq[T any](
+	ctx context.Context,
+	conn *sql.DB,
+	query string,
+	args ...any,
+) (iter.Seq2[T, error], error) {
+	it, err := QueryIterator[T](ctx, conn, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return it.Seq(), nil
+}
+
 // Identical to Query, but returns only the first result row. If there are no
 // rows in the result set, returns NotFound.
 func QueryOne[T any](
@@ -132,6 +148,23 @@ func (it *Iterator[T]) Close() {
 	select {
 	case it.closed <- struct{}{}:
 	default:
+	}
+}
+
+func (it *Iterator[T]) Seq() iter.Seq2[T, error] {
+	return func(yield func(T, error) bool) {
+		defer it.Close()
+		for {
+			var row T
+			if !it.Next(&row) {
+				var zero T
+				yield(zero, it.Err())
+				break
+			}
+			if !yield(row, nil) {
+				break
+			}
+		}
 	}
 }
 

@@ -14,7 +14,7 @@ var migrations = []db.Migration{
 		Forward: func(ctx context.Context, tx *sql.Tx) error {
 			_, err := tx.ExecContext(ctx, `
 				CREATE TABLE records (
-					id INTEGER NOT NULL PRIMARY KEY,
+					id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
 					data BLOB NOT NULL
 				);
 			`)
