@@ -14,6 +14,7 @@ import (
 
 	"github.com/bvisness/chat/db"
 	"github.com/bvisness/chat/glog"
+	rxi "github.com/bvisness/chat/serialization"
 	"github.com/bvisness/chat/utils"
 	"github.com/gorilla/websocket"
 )
@@ -40,6 +41,8 @@ var eventStreamWaitGroup sync.WaitGroup
 var eventStreamShutdownSignal = make(chan struct{})
 
 const eventStreamShutdownTimeout = 8 * time.Second
+
+var newRecordNotifications utils.Notifier
 
 type EventStreamSession struct {
 	state           EventStreamState
@@ -212,7 +215,8 @@ func hEventStream(c *Request) (res Response) {
 			}
 
 			// NOTE(ben): Explicitly request an ACK when we are done catching the client up.
-			if err := s.conn.WriteMessage(websocket.BinaryMessage, CreateSYNEvent(s.buf[:])); err != nil {
+			synBytes := utils.Must1(rxi.Serialize(CreateSYNEvent(), s.buf[:]))
+			if err := s.conn.WriteMessage(websocket.BinaryMessage, synBytes); err != nil {
 				s.unexpectedErr = fmt.Errorf("requesting ACK from client: %w", err)
 				return
 			}
@@ -262,9 +266,10 @@ func hEventStream(c *Request) (res Response) {
 				// NOTE(ben): Maybe someday we'll have the textual version of these messages, but for now
 				// only binary is supported.
 				if read.messageType != websocket.BinaryMessage {
+					errBytes := utils.Must1(rxi.Serialize(CreateErrorEvent("only binary ws messages are supported"), s.buf[:]))
 					err := s.conn.WriteMessage(
 						websocket.BinaryMessage,
-						CreateErrorEvent(s.buf[:], "only binary ws messages are supported"),
+						errBytes,
 					)
 					if err != nil {
 						return true, fmt.Errorf("on non-binary ws message: %w", err)
@@ -292,54 +297,48 @@ func hEventStream(c *Request) (res Response) {
 // Handles a single WebSocket message from the client. The error return is ONLY for unexpected
 // errors that should terminate the connection.
 func (s *EventStreamSession) handleClientEvent(ctx context.Context, eventData []byte) error {
-	p := &parser{data: eventData}
-
-	eventType, err := p.ReadByte("event type")
+	r := rxi.Reader{Data: eventData}
+	e, err := ReadEvent(&r)
 	if err != nil {
-		return s.sendErrorToClient("missing event type")
+		return s.sendErrorToClient("could not parse event: %v", err)
 	}
-	switch EventType(eventType) {
-	case ETRecord:
-		s.handleClientRecord(ctx, p)
 
+	switch e.Type {
+	case ETRecord:
+		s.handleClientRecord(ctx, &r)
+
+	case ETSYN:
+		s.clientACK = max(e.SYNACK.SN, -1)
 	case ETACK:
 		// Client acknowledging receipt of server events.
-		sn, err := p.ReadS64("client ACK SN")
-		if err != nil {
-			return s.sendErrorToClient("missing SN in client ACK")
-		}
-		s.clientACK = max(sn, -1) // NOTE(ben): -1 is reserved as having ACKed nothing
+		s.clientACK = e.SYNACK.SN
 		s.clientNeedsSync.Wake()
 
 	default:
-		return s.sendErrorToClient("unknown event type %v", eventType)
+		return s.sendErrorToClient("unknown event type %v", e.Type)
 	}
 
 	return nil
 }
 
-func (s *EventStreamSession) handleClientRecord(ctx context.Context, p *parser) error {
-	recordType, err := p.ReadByte("record type")
+func (s *EventStreamSession) handleClientRecord(ctx context.Context, r *rxi.Reader) error {
+	rec, err := ReadRecord(r)
 	if err != nil {
-		return s.sendErrorToClient("missing event type")
+		return s.sendErrorToClient("could not parse record: %v", err)
 	}
 
-	var r Record
-	switch RecordType(recordType) {
+	switch rec.Type {
 	case RTMessage:
-		text, err := p.ReadUTF8String("message text")
-		if err != nil {
-			return s.sendErrorToClient("%s", err)
-		}
-		r = Record{
-			Type:        RTMessage,
-			MessageText: text,
-		}
+		// Nothing to do; we will persist the record in the DB
+		// TODO(ben): Do we need to dedupe or something? How do we let the server
+		// ACK its persistence of this specific message? Presumably we should
+		// actually use the SN field on the incoming record, as this is the stream
+		// that the client is trying to reliably send to the server.
 	default:
-		return s.sendErrorToClient("unknown record type %v", recordType)
+		return s.sendErrorToClient("unknown record type %d", rec.Type)
 	}
 
-	serialized, err := Serialize(r, s.buf[:])
+	serialized, err := rxi.Serialize(rec, s.buf[:])
 	if err != nil {
 		return fmt.Errorf("in handleClientRecord: %w", err)
 	}
@@ -347,14 +346,14 @@ func (s *EventStreamSession) handleClientRecord(ctx context.Context, p *parser) 
 	if err != nil {
 		return fmt.Errorf("in handleClientRecord: %w", err)
 	}
-
-	// TODO: Wake all sessions because a new message has arrived?
+	newRecordNotifications.Notify()
 
 	return nil
 }
 
 func (s *EventStreamSession) sendErrorToClient(msg string, args ...any) error {
-	err := s.conn.WriteMessage(websocket.BinaryMessage, CreateErrorEvent(s.buf[:], msg, args...))
+	errBytes := utils.Must1(rxi.Serialize(CreateErrorEvent(msg, args...), s.buf[:]))
+	err := s.conn.WriteMessage(websocket.BinaryMessage, errBytes)
 	if err != nil {
 		return err
 	}

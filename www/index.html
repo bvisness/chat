@@ -98,6 +98,135 @@
   </div>
 
   <script>
+    const STError = 0;
+    const STEnd = 1;
+    const STObject = 2;
+    const STArray = 3;
+    const STFloat = 4;
+    const STBool = 5;
+    const STString = 6;
+
+    const ETRecord = 0x01;
+    const ETSYN = 0x10;
+    const ETACK = 0x11;
+    const ETTyping = 0x20;
+    const ETPresenceUpdate = 0x21;
+    const ETAuth = 0x90;
+    const ETError = 0xFE;
+    const ETReserved = 0xFF;
+
+    const RTMessage = 0;
+    const RTDeleteMessage = 1;
+    const RTEdit = 2;
+    const RTReply = 3;
+    const RTReactionAdd = 4;
+    const RTReactionRemove = 5;
+
+    function parseMessage(msg, ctx = { cur: 0 }) {
+      const dv = new DataView(msg.buffer);
+
+      const tag = dv.getUint8(ctx.cur);
+      ctx.cur += 1;
+
+      switch (tag) {
+        case STObject: {
+          const result = {};
+          while (true) {
+            const fieldTag = dv.getUint8(ctx.cur);
+            if (fieldTag === STEnd) {
+              ctx.cur += 1;
+              break
+            }
+            if (fieldTag !== STString) {
+              throw new Error(`expected string for field name (type ${STString}), but got type ${fieldTag}`);
+            }
+            const fieldName = parseMessage(msg, ctx);
+            const fieldValue = parseMessage(msg, ctx);
+            result[fieldName] = fieldValue;
+          }
+          return result;
+        } break;
+        case STArray: {
+          const result = [];
+          while (true) {
+            const fieldTag = dv.getUint8(cur);
+            if (fieldTag === STEnd) {
+              ctx.cur += 1;
+              break
+            }
+            result.push(parseMessage(msg, ctx));
+          }
+          return result;
+        } break;
+        case STFloat: {
+          const result = dv.getFloat64(ctx.cur, true);
+          ctx.cur += 8;
+          return result;
+        } break;
+        case STBool: {
+          const result = dv.getUint8(cur);
+          ctx.cur += 1;
+          if (result > 1) {
+            throw new Error(`expected bool byte but got ${result}`);
+          }
+          return result !== 0;
+        } break;
+        case STString: {
+          const length = dv.getFloat64(ctx.cur, true);
+          ctx.cur += 8;
+          const result = new TextDecoder().decode(msg.subarray(ctx.cur, ctx.cur + length));
+          ctx.cur += length;
+          return result;
+        } break;
+        default:
+          throw new Error(`unknown value type ${tag}`);
+      }
+    }
+
+    function encodeMessage(msg) {
+      const bytes = [];
+      function encodeRecursive(val) {
+        switch (Array.isArray(val) ? "array" : typeof val) {
+          case "object": {
+            bytes.push(STObject);
+            for (const [name, value] of Object.entries(val)) {
+              encodeRecursive(name);
+              encodeRecursive(value);
+            }
+            bytes.push(STEnd);
+          } break;
+          case "array": {
+            bytes.push(STArray);
+            for (const elem of val) {
+              encodeRecursive(elem);
+            }
+            bytes.push(STEnd);
+          } break;
+          case "number": {
+            bytes.push(STFloat);
+            const buf = new ArrayBuffer(8);
+            new DataView(buf).setFloat64(0, val, true);
+            bytes.push(...new Uint8Array(buf));
+          } break;
+          case "string": {
+            bytes.push(STString);
+            const buf = new ArrayBuffer(8);
+            new DataView(buf).setFloat64(0, val.length, true);
+            bytes.push(...new Uint8Array(buf));
+            bytes.push(...new TextEncoder().encode(val));
+          } break;
+          case "boolean": {
+            bytes.push(STBool);
+            bytes.push(val ? 1 : 0);
+          } break;
+          default:
+            throw new Error(`cannot encode values of type ${typeof val}`);
+        }
+      }
+      encodeRecursive(msg);
+      return new Uint8Array(bytes);
+    }
+
     async function test(container) {
       const input = container.querySelector("input");
       const log = container.querySelector(".log");
@@ -114,30 +243,30 @@
         rejectWsReady(err);
       });
 
-      function createLogCell(msg) {
+      function createLogCell(msgBytes) {
         const td = document.createElement("td");
         const pre = document.createElement("pre");
-        for (let i = 0; i < msg.length; i++) {
+        for (let i = 0; i < msgBytes.length; i++) {
           if (i > 0 && i % 16 === 0) {
             pre.innerHTML += "\n";
           } else if (i > 0) {
             pre.innerHTML += " ";
           }
-          pre.innerHTML += msg[i].toString(16).padStart(2, "0");
+          pre.innerHTML += msgBytes[i].toString(16).padStart(2, "0");
         }
         td.appendChild(pre);
         return td;
       }
-      function createHexView(msg) {
+      function createHexView(msgBytes) {
         const td = document.createElement("td");
         const pre = document.createElement("pre");
-        for (let r = 0; r <= Math.floor(msg.length / 16); r++) {
+        for (let r = 0; r <= Math.floor(msgBytes.length / 16); r++) {
           if (r > 0) {
             pre.innerHTML += "\n";
           }
           pre.innerHTML += "| ";
           for (let i = 0; i < 16; i++) {
-            const b = msg[16 * r + i];
+            const b = msgBytes[16 * r + i];
             if (b === undefined) {
               pre.innerHTML += " ";
             } else if (0x20 <= b && b <= 0x7E) {
@@ -154,49 +283,56 @@
 
       let latestServerSN = -1n;
       function send(msg) {
+        console.debug("Client event", msg);
+        const msgBytes = encodeMessage(msg);
         const row = document.createElement("tr");
-        row.appendChild(createLogCell(msg));
+        row.appendChild(createLogCell(msgBytes));
         row.appendChild(document.createElement("td"));
-        row.appendChild(createHexView(msg));
+        row.appendChild(createHexView(msgBytes));
         container.querySelector("tbody").appendChild(row);
-        ws.send(msg);
+        ws.send(msgBytes);
       }
-      function receive(msg) {
+      function receive(msgBytes) {
         const row = document.createElement("tr");
         row.appendChild(document.createElement("td"));
-        row.appendChild(createLogCell(msg));
-        row.appendChild(createHexView(msg));
+        row.appendChild(createLogCell(msgBytes));
+        row.appendChild(createHexView(msgBytes));
         container.querySelector("tbody").appendChild(row);
 
-        switch (msg[0]) {
-        case 0x01: { // MTEvent
-          const sn = new DataView(msg.buffer).getBigInt64(1, true);
-          const eventType = new DataView(msg.buffer).getUint8(1+8);
-          console.log(`Latest server SN is ${sn} (was ${latestServerSN})`);
-          latestServerSN = sn;
-          // TODO(ben): ACK periodically while receiving normal messages, before receiving
-          // an ACKPLZ
+        const msg = parseMessage(msgBytes);
+        console.debug("Server event", msg);
 
-          switch (eventType) {
-          case 0: { // ETMessage
-            const textLength = new DataView(msg.buffer).getUint32(1+8+1, true);
-            const text = new TextDecoder().decode(msg.subarray(1+8+1+4, 1+8+1+4+textLength));
+        switch (msg.type) {
+          case ETRecord: {
+            const record = event.record;
 
-            const row = document.createElement("div");
-            row.innerText = text;
-            log.appendChild(row);
-            row.scrollIntoView({ behavior: "instant", block: "end" });
+            console.log(`Latest server SN is ${record.sn} (was ${latestServerSN})`);
+            latestServerSN = record.sn;
+            // TODO(ben): ACK periodically while receiving normal messages, before receiving
+            // a SYN
+
+            switch (record.type) {
+            case RTMessage: {
+              const row = document.createElement("div");
+              row.innerText = record.messageText;
+              log.appendChild(row);
+              row.scrollIntoView({ behavior: "instant", block: "end" });
+            } break;
+            default:
+              console.error(`unknown record type ${record.type}`);
+            }
           } break;
-          }
-        } break;
-        case 0x81: { // MTACKPLZ
-          const ack = new Uint8Array([
-            0x80, // MTACK
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Dummy SN
-          ]);
-          new DataView(ack.buffer).setBigInt64(1, BigInt(latestServerSN), true);
-          send(ack);
-        } break;
+
+          case ETSYN: {
+            send({ type: ETACK, sn: latestServerSN });
+          } break;
+
+          case ETError: {
+            console.error(msg.message);
+          } break;
+
+          default:
+            console.error(`unknown event type ${msg.type}`);
         }
       }
 
@@ -208,32 +344,22 @@
         if (e.key === "Enter") {
           let text = input.value.trim();
           if (text.length > 0) {
-            const textBytes = new TextEncoder().encode(text);
-            // TODO(ben): Enforce a max length that fits the max message size
-            const msg = new Uint8Array(1 + 1 + 4 + textBytes.length);
-            // TODO(ben): This is just super wrong now because it doesn't have an SN. Protocols for
-            // me for not for thee!!
-            new DataView(msg.buffer).setUint8(0, 0x01); // MTEvent
-            new DataView(msg.buffer).setUint8(1, 0x00); // ETMessage
-            new DataView(msg.buffer).setUint32(2, textBytes.length, true);
-            msg.set(textBytes, 6);
-            send(msg);
+            send({
+              type: ETRecord,
+              record: {
+                type: RTMessage,
+                messageText: text,
+              },
+            });
             input.value = "";
           }
         }
       });
       
       await wsReady;
-      send(new Uint8Array([
-        0x80, // MTACK
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // -1
-      ]));
-      // send(new Uint8Array([
-      //   0x01, // MTChatMessage
-      //   0x00, // ETMessage
-      //   0x05, 0x00, 0x00, 0x00, // 5 letters
-      //   0x68, 0x65, 0x6C, 0x6C, 0x6F, // hello
-      // ]));
+      send({
+        type: ETSYN,
+      });
       // setTimeout(() => ws.close(1000), 2000);
     };
 

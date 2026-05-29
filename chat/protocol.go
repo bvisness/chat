@@ -2,6 +2,8 @@ package chat
 
 import (
 	"fmt"
+
+	rxi "github.com/bvisness/chat/serialization"
 )
 
 // ============================================================================
@@ -47,33 +49,87 @@ const (
 	ETReserved EventType = 0xFF
 )
 
-func CreateSYNEvent(buf []byte) []byte {
-	w := Writer{buf: buf}
-	w.Object()
-	w.FieldByte("type", byte(ETSYN))
-	w.End()
-	if w.Err() != nil {
-		panic(w.Err())
-	}
-	return w.Written()
+type Event struct {
+	Type EventType
+
+	// Type-specific payloads
+	Record *Record
+	SYNACK *EventSYNACK
+	Error  *EventError
 }
 
-func CreateErrorEvent(buf []byte, msg string, args ...any) []byte {
-	w := Writer{buf: buf}
-	w.Object()
-	w.FieldByte("type", byte(ETError))
-	w.FieldStr("message", fmt.Sprintf(msg, args...))
-	w.End()
-	if w.Err() != nil {
-		panic(w.Err())
-	}
-	return w.Written()
+type EventSYNACK struct {
+	SN int64
 }
 
-// TODO(ben): Whatever the protocol ends up being, I do feel it would be wise to design a binary
-// protocol that is at least a little bit key/value. It would be very useful to be able to create a
-// generic message inspector that could render messages that are well-formed but nonetheless
-// invalid.
+type EventError struct {
+	Message string
+}
+
+func CreateSYNEvent() Event {
+	return Event{Type: ETSYN}
+}
+
+func CreateErrorEvent(msg string, args ...any) Event {
+	return Event{
+		Type: ETError,
+		Error: &EventError{
+			Message: fmt.Sprintf(msg, args...),
+		},
+	}
+}
+
+func (e Event) Write(w *rxi.Writer) {
+	w.Object()
+	w.FieldByte("type", byte(e.Type))
+	switch e.Type {
+	case ETRecord:
+		w.FieldWritable("record", e.Record)
+	case ETSYN, ETACK:
+		w.FieldS64("sn", e.SYNACK.SN)
+	case ETError:
+		w.FieldStr("message", e.Error.Message)
+	default:
+		panic(fmt.Errorf("cannot serialize event of type %v", e.Type))
+	}
+	w.End()
+}
+
+func ReadEvent(r *rxi.Reader) (Event, error) {
+	var res Event
+	obj, err := r.Object()
+	if err != nil {
+		return Event{}, err
+	}
+
+	// The "type" field must come first, always.
+	rawType, err := r.FloatField(rxi.StrVal("type"))
+	if err != nil {
+		return Event{}, fmt.Errorf("type must be first field: %w", err)
+	}
+	res.Type = EventType(rawType)
+
+	switch res.Type {
+	case ETRecord:
+		// TODO
+
+	case ETSYN, ETACK:
+		var payload EventSYNACK
+		res.SYNACK = &payload
+		for key, val := range r.IterObject(obj) {
+			var err error
+			if rxi.FieldHasType(key, rxi.StrVal("sn"), val, rxi.STFloat, &err) {
+				payload.SN = int64(val.F)
+				if payload.SN < 0 {
+					return Event{}, fmt.Errorf("ACK SN cannot be negative: %d", payload.SN)
+				}
+			} else if err != nil {
+				return Event{}, err
+			}
+		}
+	}
+	return res, nil
+}
 
 type RecordType byte
 
@@ -87,3 +143,67 @@ const (
 
 	RTReserved RecordType = 0xFF
 )
+
+type Record struct {
+	// A global sequence number identifying this record. For server -> client
+	// communication, this SN is an authoritative ID for the record, shared by
+	// all clients, and is always increasing, meaning that clients can always
+	// order server records by SN. For client -> server communication, this SN is
+	// unique to the session and is used to guarantee reliability against
+	// application level failures in the server (e.g. the server crashing after
+	// receiving a record but before writing it to disk).
+	//
+	// This implies that the SN of a record will be different when the client
+	// receives it back from the server in its event stream.
+	SN   int64
+	Type RecordType
+
+	// Message properties
+	MessageText string
+}
+
+func (r Record) Write(w *rxi.Writer) {
+	w.Object()
+	if r.SN != 0 {
+		w.FieldS64("sn", r.SN)
+	}
+	w.FieldByte("type", byte(r.Type))
+	switch r.Type {
+	case RTMessage:
+		w.FieldStr("messageText", r.MessageText)
+	default:
+		panic(fmt.Errorf("in Record.Write: cannot write record type %v", r.Type))
+	}
+	w.End()
+}
+
+func ReadRecord(r *rxi.Reader) (Record, error) {
+	var res Record
+	obj, err := r.Object()
+	if err != nil {
+		return Record{}, err
+	}
+
+	// The "type" field must come first, always.
+	rawType, err := r.FloatField(rxi.StrVal("type"))
+	if err != nil {
+		return Record{}, fmt.Errorf("type must be first field: %w", err)
+	}
+	res.Type = RecordType(rawType)
+
+	switch res.Type {
+	case RTMessage:
+		for key, val := range r.IterObject(obj) {
+			var err error
+			if rxi.FieldHasType(key, rxi.StrVal("text"), val, rxi.STString, &err) {
+				res.MessageText = val.S
+			} else if err != nil {
+				return Record{}, err
+			}
+		}
+	default:
+		return Record{}, fmt.Errorf("unknown record type %d", res.Type)
+	}
+
+	return res, nil
+}
