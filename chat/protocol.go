@@ -140,9 +140,6 @@ func ReadEvent(r *rxi.Reader) (Event, error) {
 			var err error
 			if rxi.FieldHasType(key, rxi.StrVal("sn"), val, rxi.STFloat, &err) {
 				payload.SN = int64(val.F)
-				if payload.SN < 0 {
-					return Event{}, fmt.Errorf("ACK SN cannot be negative: %d", payload.SN)
-				}
 			} else if err != nil {
 				return Event{}, err
 			}

@@ -1,0 +1,11 @@
+{
+  "scripts": {
+    "tsc": "npx tsc --noEmit --watch",
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0",
+    "typescript": "^6.0.3"
+  }
+}

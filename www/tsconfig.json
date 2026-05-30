@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2024", // Output modern JS
+    "module": "node16", // Require extensions on relative imports. Should still be bundler-compatible.
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "lib": [
+      "DOM",
+      "ES2024"
+    ],
+    "outDir": "dist",
+    "declaration": true,
+    "sourceMap": true,
+  },
+  "include": [
+    "src/**/*"
+  ]
+}

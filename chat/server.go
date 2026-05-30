@@ -126,7 +126,7 @@ func mainHandler(rawRes http.ResponseWriter, rawReq *http.Request) {
 	}
 }
 
-var wwwHandler = http.FileServer(http.Dir("www"))
+var wwwHandler = http.FileServer(http.Dir("www/dist"))
 
 func serveStaticFiles(rawRes http.ResponseWriter, rawReq *http.Request) {
 	wwwHandler.ServeHTTP(rawRes, rawReq)
