@@ -299,10 +299,10 @@
         row.appendChild(createHexView(msgBytes));
         container.querySelector("tbody").appendChild(row);
 
-        const msg = parseMessage(msgBytes);
-        console.debug("Server event", msg);
+        const event = parseMessage(msgBytes);
+        console.debug("Server event", event);
 
-        switch (msg.type) {
+        switch (event.type) {
           case ETRecord: {
             const record = event.record;
 
@@ -314,7 +314,7 @@
             switch (record.type) {
             case RTMessage: {
               const row = document.createElement("div");
-              row.innerText = record.messageText;
+              row.innerText = record.text;
               log.appendChild(row);
               row.scrollIntoView({ behavior: "instant", block: "end" });
             } break;
@@ -328,11 +328,11 @@
           } break;
 
           case ETError: {
-            console.error(msg.message);
+            console.error(event.message);
           } break;
 
           default:
-            console.error(`unknown event type ${msg.type}`);
+            console.error(`unknown event type ${event.type}`);
         }
       }
 
@@ -348,7 +348,7 @@
               type: ETRecord,
               record: {
                 type: RTMessage,
-                messageText: text,
+                text: text,
               },
             });
             input.value = "";

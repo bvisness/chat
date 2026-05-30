@@ -2,7 +2,6 @@ package chat
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -47,7 +46,6 @@ var newRecordNotifications utils.Notifier
 type EventStreamSession struct {
 	state           EventStreamState
 	conn            *websocket.Conn
-	db              *sql.DB
 	clientNeedsSync utils.Waiter
 	clientACK       int64
 
@@ -182,9 +180,9 @@ func hEventStream(c *Request) (res Response) {
 				SN   int64  `db:"id"`
 				Data []byte `db:"data"`
 			}
-			rows, err := db.Query[row](c.Ctx, s.db, `
+			rows, err := db.Query[row](c.Ctx, dbConn, `
 				SELECT $columns FROM records
-				WHERE id > $?
+				WHERE id > ?
 			`, s.clientACK)
 			if err != nil {
 				s.unexpectedErr = fmt.Errorf("querying records: %w", err)
@@ -205,17 +203,25 @@ func hEventStream(c *Request) (res Response) {
 
 			// HACK(ben): Abusing the fact that, for now, SN == index in Events
 			for _, row := range rows {
-				// TODO: Re-serialize the data here so that clients don't have to keep
-				// up with the full history of versions
+				rec, err := ReadRecord(&rxi.Reader{Data: row.Data})
+				if err != nil {
+					s.unexpectedErr = fmt.Errorf("reading record from db: %w", err)
+					return
+				}
+				rec.SN = row.SN
 
-				if err := s.conn.WriteMessage(websocket.BinaryMessage, row.Data); err != nil {
+				eventBytes := utils.Must1(rxi.Serialize(Event{
+					Type:   ETRecord,
+					Record: &rec,
+				}, s.buf[:]))
+				if err := s.conn.WriteMessage(websocket.BinaryMessage, eventBytes); err != nil {
 					s.unexpectedErr = fmt.Errorf("sending event to client: %w", err)
 					return
 				}
 			}
 
 			// NOTE(ben): Explicitly request an ACK when we are done catching the client up.
-			synBytes := utils.Must1(rxi.Serialize(CreateSYNEvent(), s.buf[:]))
+			synBytes := utils.Must1(rxi.Serialize(CreateSYNEvent(-1), s.buf[:]))
 			if err := s.conn.WriteMessage(websocket.BinaryMessage, synBytes); err != nil {
 				s.unexpectedErr = fmt.Errorf("requesting ACK from client: %w", err)
 				return
@@ -305,12 +311,12 @@ func (s *EventStreamSession) handleClientEvent(ctx context.Context, eventData []
 
 	switch e.Type {
 	case ETRecord:
-		s.handleClientRecord(ctx, &r)
+		s.handleClientRecord(ctx, e.Record)
 
-	case ETSYN:
+	case ETSYN, ETACK:
+		// Client requesting a sync or ACKing existing messages (which means one
+		// way or another we should be kicking off a sync)
 		s.clientACK = max(e.SYNACK.SN, -1)
-	case ETACK:
-		// Client acknowledging receipt of server events.
 		s.clientACK = e.SYNACK.SN
 		s.clientNeedsSync.Wake()
 
@@ -321,12 +327,7 @@ func (s *EventStreamSession) handleClientEvent(ctx context.Context, eventData []
 	return nil
 }
 
-func (s *EventStreamSession) handleClientRecord(ctx context.Context, r *rxi.Reader) error {
-	rec, err := ReadRecord(r)
-	if err != nil {
-		return s.sendErrorToClient("could not parse record: %v", err)
-	}
-
+func (s *EventStreamSession) handleClientRecord(ctx context.Context, rec *Record) error {
 	switch rec.Type {
 	case RTMessage:
 		// Nothing to do; we will persist the record in the DB
@@ -342,7 +343,7 @@ func (s *EventStreamSession) handleClientRecord(ctx context.Context, r *rxi.Read
 	if err != nil {
 		return fmt.Errorf("in handleClientRecord: %w", err)
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO records (data) VALUES (?)`, serialized)
+	_, err = dbConn.ExecContext(ctx, `INSERT INTO records (data) VALUES (?)`, serialized)
 	if err != nil {
 		return fmt.Errorf("in handleClientRecord: %w", err)
 	}

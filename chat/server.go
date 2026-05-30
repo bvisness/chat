@@ -20,13 +20,14 @@ import (
 const serverShutdownTimeout = 10 * time.Second
 
 var log = glog.Logger{}
+var dbConn *sql.DB
 
 func Run() {
 	var wg sync.WaitGroup
 
-	conn := utils.Must1(sql.Open("sqlite3", "file:chat.db"))
-	defer conn.Close()
-	utils.Must(migrator.Migrate(context.Background(), conn, migrations, db.MigrateAll))
+	dbConn = utils.Must1(sql.Open("sqlite3", "file:chat.db"))
+	defer dbConn.Close()
+	utils.Must(migrator.Migrate(context.Background(), dbConn, migrations, db.MigrateAll))
 
 	wg.Add(1)
 	server := http.Server{

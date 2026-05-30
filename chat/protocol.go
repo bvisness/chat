@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	rxi "github.com/bvisness/chat/serialization"
+	"github.com/bvisness/chat/utils"
 )
 
 // ============================================================================
@@ -66,8 +67,13 @@ type EventError struct {
 	Message string
 }
 
-func CreateSYNEvent() Event {
-	return Event{Type: ETSYN}
+func CreateSYNEvent(sn int64) Event {
+	return Event{
+		Type: ETSYN,
+		SYNACK: &EventSYNACK{
+			SN: sn,
+		},
+	}
 }
 
 func CreateErrorEvent(msg string, args ...any) Event {
@@ -84,10 +90,13 @@ func (e Event) Write(w *rxi.Writer) {
 	w.FieldByte("type", byte(e.Type))
 	switch e.Type {
 	case ETRecord:
+		utils.Assert(e.Record, "missing payload for event of type", e.Type)
 		w.FieldWritable("record", e.Record)
 	case ETSYN, ETACK:
+		utils.Assert(e.SYNACK, "missing payload for event of type", e.Type)
 		w.FieldS64("sn", e.SYNACK.SN)
 	case ETError:
+		utils.Assert(e.Error, "missing payload for event of type", e.Type)
 		w.FieldStr("message", e.Error.Message)
 	default:
 		panic(fmt.Errorf("cannot serialize event of type %v", e.Type))
@@ -97,7 +106,7 @@ func (e Event) Write(w *rxi.Writer) {
 
 func ReadEvent(r *rxi.Reader) (Event, error) {
 	var res Event
-	obj, err := r.Object()
+	evtObj, err := r.Object()
 	if err != nil {
 		return Event{}, err
 	}
@@ -111,12 +120,23 @@ func ReadEvent(r *rxi.Reader) (Event, error) {
 
 	switch res.Type {
 	case ETRecord:
-		// TODO
+		for key, recObj := range r.IterObject(evtObj) {
+			var err error
+			if rxi.FieldHasType(key, rxi.StrVal("record"), recObj, rxi.STObject, &err) {
+				rec, err := IterRecord(r, recObj)
+				if err != nil {
+					return Event{}, err
+				}
+				res.Record = &rec
+			} else if err != nil {
+				return Event{}, err
+			}
+		}
 
 	case ETSYN, ETACK:
 		var payload EventSYNACK
 		res.SYNACK = &payload
-		for key, val := range r.IterObject(obj) {
+		for key, val := range r.IterObject(evtObj) {
 			var err error
 			if rxi.FieldHasType(key, rxi.StrVal("sn"), val, rxi.STFloat, &err) {
 				payload.SN = int64(val.F)
@@ -170,7 +190,7 @@ func (r Record) Write(w *rxi.Writer) {
 	w.FieldByte("type", byte(r.Type))
 	switch r.Type {
 	case RTMessage:
-		w.FieldStr("messageText", r.MessageText)
+		w.FieldStr("text", r.MessageText)
 	default:
 		panic(fmt.Errorf("in Record.Write: cannot write record type %v", r.Type))
 	}
@@ -178,11 +198,19 @@ func (r Record) Write(w *rxi.Writer) {
 }
 
 func ReadRecord(r *rxi.Reader) (Record, error) {
-	var res Record
 	obj, err := r.Object()
 	if err != nil {
 		return Record{}, err
 	}
+	rec, err := IterRecord(r, obj)
+	if err != nil {
+		return Record{}, err
+	}
+	return rec, nil
+}
+
+func IterRecord(r *rxi.Reader, obj rxi.Val) (Record, error) {
+	var res Record
 
 	// The "type" field must come first, always.
 	rawType, err := r.FloatField(rxi.StrVal("type"))
