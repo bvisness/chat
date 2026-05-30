@@ -2,99 +2,14 @@
 
 <head>
   <title>WebSocket Test</title>
-  <style>
-    * {
-      box-sizing: border-box;
-    }
-
-    table {
-      border-collapse: collapse;
-    }
-
-    td {
-      border: 1px solid black;
-      padding: 0.5rem;
-      vertical-align: top;
-    }
-
-    pre {
-      margin: 0;
-    }
-
-    .two-wide {
-      display: flex;
-      gap: 1rem;
-
-      > * {
-        flex-basis: 0;
-        flex-grow: 1;
-        flex-shrink: 1;
-      }
-    }
-
-    .chat {
-      width: 20rem;
-      margin-bottom: 1rem;
-      height: 16rem;
-      display: flex;
-      flex-direction: column;
-      border: 1px solid black;
-
-      .log {
-        flex-grow: 1;
-        overflow-y: scroll;
-
-        div {
-          padding: 0.1rem 0.25rem;
-        }
-      }
-
-      input {
-        /* width: 100%; */
-        flex-shrink: 0;
-        margin: 2px;
-      }
-    }
-  </style>
+  <link rel="stylesheet" href="style.css">
 </head>
 
 <body>
   <p>Time to test a server.</p>
   <div class="two-wide">
-    <div id="one">
-      <div class="chat">
-        <div class="log"></div>
-        <input type="text">
-      </div>
-      <table>
-        <thead>
-          <tr>
-            <th>Sent</th>
-            <th>Received</th>
-            <th>Preview</th>
-          </tr>
-        </thead>
-        <tbody>
-        </tbody>
-      </table>
-    </div>
-    <div id="two">
-      <div class="chat">
-        <div class="log"></div>
-        <input type="text">
-      </div>
-      <table>
-        <thead>
-          <tr>
-            <th>Sent</th>
-            <th>Received</th>
-            <th>Preview</th>
-          </tr>
-        </thead>
-        <tbody>
-        </tbody>
-      </table>
-    </div>
+    <div id="one"></div>
+    <div id="two"></div>
   </div>
 
   <script type="module" src="index.js"></script>

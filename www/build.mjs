@@ -14,7 +14,7 @@ const config = {
   target: ["es2024","firefox150"],
   format: "esm",
   sourcemap: true,
-  minify: true,
+  // minify: true,
 };
 
 function findFiles(dir, matches, result) {
